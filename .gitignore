@@ -1,0 +1,19 @@
+# Gradle / build
+.gradle/
+build/
+app/build/
+app/.cxx/
+
+# Kotlin
+.kotlin/
+
+# IDE
+.idea/
+*.iml
+
+# Local SDK config (machine-specific)
+local.properties
+
+# OS
+.DS_Store
+Thumbs.db
