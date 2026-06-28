@@ -4,14 +4,17 @@ import android.view.KeyEvent
 import android.view.MotionEvent
 import android.view.View
 import com.example.autoservice.carplay.CarplayNative
+import com.linkcast.receiver.ProjectionMetrics
 
 class InputForwarder {
     fun onTouch(view: View, event: MotionEvent): Boolean {
-        val x = ((event.x / view.width.coerceAtLeast(1)) * 1280).toInt()
-        val y = ((event.y / view.height.coerceAtLeast(1)) * 720).toInt()
-        // Native signature is onTouchEvent(x, y, pressed): pressed=1 while the finger is
-        // down/moving, 0 when it lifts. Matches CarplayService.e():
-        // new e3.f(x, y, (action==0||action==2)?1:0). (We had the args in the wrong order.)
+        val projWidth = ProjectionMetrics.width
+        val projHeight = ProjectionMetrics.height
+        if (projWidth <= 0 || projHeight <= 0) return false
+        // 触控坐标按当前投屏分辨率换算
+        val x = ((event.x / view.width.coerceAtLeast(1)) * projWidth).toInt()
+        val y = ((event.y / view.height.coerceAtLeast(1)) * projHeight).toInt()
+        // onTouchEvent(x, y, pressed):手指按下/移动时 pressed=1,抬起时 0
         val a = event.actionMasked
         val pressed = if (a == MotionEvent.ACTION_DOWN || a == MotionEvent.ACTION_MOVE) 1 else 0
         CarplayNative.onTouchEvent(x, y, pressed)

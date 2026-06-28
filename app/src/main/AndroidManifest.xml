@@ -22,6 +22,7 @@
         android:allowBackup="false"
         android:label="@string/app_name"
         android:supportsRtl="true"
+        android:theme="@style/Theme.LinkCast"
         android:usesCleartextTraffic="true">
         <activity
             android:name=".ui.MainActivity"

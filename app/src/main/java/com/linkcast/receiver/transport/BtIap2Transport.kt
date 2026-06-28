@@ -112,8 +112,7 @@ class BtIap2Transport(
             listener.onTransportLog("Connecting RFCOMM to ${device.name ?: device.address}")
             try {
                 adapter.cancelDiscovery()
-                // Match the reference order: create the iAP2 link FIRST (before the
-                // RFCOMM socket connects) and start the native engine, then connect.
+                // 先创建 iAP2 链路、启动原生引擎,再连接 RFCOMM。
                 linkHandle = CarplayNative.createIap2LinkHandle()
                 listener.onLinkReady()
                 device.createRfcommSocketToServiceRecord(IAP2_UUID).use { btSocket ->

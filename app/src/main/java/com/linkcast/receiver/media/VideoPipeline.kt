@@ -30,15 +30,22 @@ class VideoPipeline {
     @Volatile private var width = 1280
     @Volatile private var height = 720
 
+    // 解码器(重新)就绪后回调,用于向发送端请求一个关键帧,否则新解码器无 IDR 不出画面。
+    @Volatile var onDecoderReady: (() -> Unit)? = null
+
     fun setSurface(surface: Surface?, width: Int, height: Int) {
         handler.post {
+            val previous = this.surface
             this.surface = surface
-            // NOTE: do NOT set width/height from the SurfaceView size — those are the
-            // DISPLAY dimensions (e.g. full-screen 3840x2264). The decoder must be
-            // configured with the VIDEO stream size (1280x720); MediaCodec scales to the
-            // surface automatically and adapts to the real size via OUTPUT_FORMAT_CHANGED.
-            // Build the decoder lazily on the first frame; only rebuild on surface swap.
-            if (codec != null) rebuildDecoder()
+            // 解码器尺寸用视频流尺寸而非 SurfaceView 尺寸,MediaCodec 自动缩放到 surface。
+            when {
+                surface == null -> releaseDecoder()
+                // 重新获得 surface(如从主页返回):重建解码器并请求关键帧以恢复画面。
+                surface != previous -> {
+                    Log.d(TAG, "surface 重新挂载,重建解码器并请求关键帧")
+                    if (rebuildDecoder() != null) onDecoderReady?.invoke()
+                }
+            }
         }
     }
 
@@ -62,6 +69,7 @@ class VideoPipeline {
                     Log.d(TAG, "First video frame: ${buffer.remaining()}B flags=$flags surface=${surface != null}")
                 }
                 frameCount++
+                if (frameCount % 60 == 1L) Log.d(TAG, "视频帧 #$frameCount keyFrame=${(flags and 0x8000) != 0}")
                 val decoder = codec ?: rebuildDecoder()
                 if (decoder == null) {
                     if (frameCount % 60 == 1L) Log.w(TAG, "No decoder (surface=${surface != null}); dropping frame #$frameCount")

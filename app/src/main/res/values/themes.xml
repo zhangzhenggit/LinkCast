@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- 无标题栏全屏主题,投屏画面铺满整屏。 -->
+    <style name="Theme.LinkCast" parent="@android:style/Theme.Material.NoActionBar.Fullscreen">
+        <item name="android:windowNoTitle">true</item>
+        <item name="android:windowActionBar">false</item>
+        <item name="android:windowBackground">@android:color/black</item>
+    </style>
+</resources>

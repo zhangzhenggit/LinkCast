@@ -12,6 +12,7 @@ import android.os.SystemClock
 import android.util.Log
 import com.linkcast.receiver.AuthProvider
 import com.linkcast.receiver.EmptyAuthProvider
+import com.linkcast.receiver.Prefs
 import java.io.File
 import java.security.MessageDigest
 import java.util.Locale
@@ -201,7 +202,7 @@ private class UsbMfiAuthProvider private constructor(
         val ukeyId = "usb" + digest.joinToString(separator = "") { byte ->
             "%02x".format(Locale.US, byte.toInt() and 0xff)
         }
-        context.getSharedPreferences("SP", Context.MODE_PRIVATE)
+        context.getSharedPreferences(Prefs.CREDENTIAL, Context.MODE_PRIVATE)
             .edit()
             .putString("ukeyid", ukeyId)
             .apply()

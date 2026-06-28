@@ -5,12 +5,17 @@ import android.app.Activity
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
+import android.graphics.SurfaceTexture
 import android.view.Gravity
 import android.view.KeyEvent
-import android.view.SurfaceHolder
-import android.view.SurfaceView
+import android.view.Surface
+import android.view.TextureView
 import android.view.View
 import android.view.ViewGroup
+import android.view.WindowManager
+import androidx.core.view.WindowCompat
+import androidx.core.view.WindowInsetsCompat
+import androidx.core.view.WindowInsetsControllerCompat
 import android.widget.Button
 import android.widget.FrameLayout
 import android.widget.LinearLayout
@@ -18,9 +23,10 @@ import android.widget.TextView
 import com.linkcast.receiver.ProjectionService
 import com.linkcast.receiver.input.InputForwarder
 
-class MainActivity : Activity(), SurfaceHolder.Callback, ProjectionService.StatusListener {
+class MainActivity : Activity(), TextureView.SurfaceTextureListener, ProjectionService.StatusListener {
     private val inputForwarder = InputForwarder()
-    private lateinit var surfaceView: SurfaceView
+    private lateinit var textureView: TextureView
+    private var surface: Surface? = null
     private lateinit var phaseView: TextView
     private lateinit var logView: TextView
     private lateinit var connectButton: Button
@@ -32,10 +38,11 @@ class MainActivity : Activity(), SurfaceHolder.Callback, ProjectionService.Statu
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        enterFullscreen()
         requestRuntimePermissions()
 
-        surfaceView = SurfaceView(this).apply {
-            holder.addCallback(this@MainActivity)
+        textureView = TextureView(this).apply {
+            surfaceTextureListener = this@MainActivity
             isFocusable = true
             isFocusableInTouchMode = true
             setOnTouchListener { view, event -> inputForwarder.onTouch(view, event) }
@@ -86,7 +93,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback, ProjectionService.Statu
 
         setContentView(FrameLayout(this).apply {
             setBackgroundColor(0xff111318.toInt())
-            addView(surfaceView, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
+            addView(textureView, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
             addView(panel, FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.TOP or Gravity.START))
             addView(toggleButton, FrameLayout.LayoutParams(120, 120, Gravity.TOP or Gravity.END))
         })
@@ -98,12 +105,8 @@ class MainActivity : Activity(), SurfaceHolder.Callback, ProjectionService.Statu
     override fun onResume() {
         super.onResume()
         ProjectionService.statusListener = this
-        // Re-attach the surface if it already exists (surfaceCreated may have fired
-        // before the service was up, so push it again now that everything is ready).
-        val holder = surfaceView.holder
-        if (holder.surface?.isValid == true) {
-            ProjectionService.attachSurface(holder.surface, surfaceView.width, surfaceView.height)
-        }
+        // SurfaceTexture 在切后台时不销毁;回前台若已存在则重新挂载到投屏。
+        surface?.let { ProjectionService.attachSurface(it, textureView.width, textureView.height) }
         // Render the latest known phase immediately on (re)bind.
         onPhase(ProjectionService.lastPhase, ProjectionService.isConnecting)
     }
@@ -132,23 +135,47 @@ class MainActivity : Activity(), SurfaceHolder.Callback, ProjectionService.Statu
     override fun onDestroy() {
         if (ProjectionService.statusListener === this) ProjectionService.statusListener = null
         ProjectionService.attachSurface(null, 0, 0)
+        surface?.release()
+        surface = null
         super.onDestroy()
     }
 
-    override fun surfaceCreated(holder: SurfaceHolder) {
-        ProjectionService.attachSurface(holder.surface, surfaceView.width, surfaceView.height)
+    override fun onSurfaceTextureAvailable(texture: SurfaceTexture, width: Int, height: Int) {
+        surface = Surface(texture)
+        ProjectionService.attachSurface(surface, width, height)
     }
 
-    override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {
-        ProjectionService.attachSurface(holder.surface, width, height)
+    override fun onSurfaceTextureSizeChanged(texture: SurfaceTexture, width: Int, height: Int) {
+        ProjectionService.attachSurface(surface, width, height)
     }
 
-    override fun surfaceDestroyed(holder: SurfaceHolder) {
-        ProjectionService.attachSurface(null, 0, 0)
-    }
+    // 返回 false:切后台时保留 SurfaceTexture,使投屏画面流不中断,回前台无需重建。
+    override fun onSurfaceTextureDestroyed(texture: SurfaceTexture): Boolean = false
+
+    override fun onSurfaceTextureUpdated(texture: SurfaceTexture) {}
 
     override fun dispatchKeyEvent(event: KeyEvent): Boolean {
         return inputForwarder.onKey(event) || super.dispatchKeyEvent(event)
+    }
+
+    override fun onWindowFocusChanged(hasFocus: Boolean) {
+        super.onWindowFocusChanged(hasFocus)
+        if (hasFocus) enterFullscreen()
+    }
+
+    // 沉浸式全屏:铺满刘海/挖孔区,隐藏状态栏与导航栏(上滑临时唤出)。
+    private fun enterFullscreen() {
+        if (Build.VERSION.SDK_INT >= 28) {
+            window.attributes = window.attributes.apply {
+                layoutInDisplayCutoutMode =
+                    WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
+            }
+        }
+        WindowCompat.setDecorFitsSystemWindows(window, false)
+        WindowInsetsControllerCompat(window, window.decorView).apply {
+            hide(WindowInsetsCompat.Type.systemBars())
+            systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+        }
     }
 
     private fun requestRuntimePermissions() {

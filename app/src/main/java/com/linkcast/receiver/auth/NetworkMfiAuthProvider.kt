@@ -2,12 +2,12 @@ package com.linkcast.receiver.auth
 
 import android.content.Context
 import android.os.SystemClock
-import android.provider.Settings
 import android.util.DisplayMetrics
 import android.view.WindowManager
 import com.example.autoservice.carplay.CarplayNative
 import com.linkcast.receiver.AuthProvider
 import com.linkcast.receiver.ReceiverConfig
+import com.linkcast.receiver.net.RemoteConfig
 import java.io.InputStream
 import java.io.OutputStream
 import java.net.InetAddress
@@ -28,11 +28,6 @@ class NetworkMfiAuthProvider private constructor(
 
     companion object {
         private const val TAG = "Network MFI"
-        private const val DEFAULT_HOST = "www.iamonroad.com"
-        // Identity the paid MFi service is keyed to. Android 8+ scopes ANDROID_ID per
-        // signing key, so this app's own ANDROID_ID is not the registered one; reuse
-        // the companion app's ANDROID_ID so the service recognises the entitlement.
-        private const val COMPANION_ANDROID_ID = "C6A763914B504C1E"
         private const val CONNECT_TIMEOUT_MS = 6_000
         private const val HANDSHAKE_TIMEOUT_MS = 5_000
         private const val SESSION_TIMEOUT_MS = 60_000
@@ -44,36 +39,31 @@ class NetworkMfiAuthProvider private constructor(
         private const val QUEUE_RETRY_DELAY_MS = 1_500L
         private const val MAX_QUEUE_RETRIES = 40
         private const val ORIGINAL_VERSION_CODE = 297L
-        private val DEFAULT_PORTS = intArrayOf(1522, 1525, 1500, 1505, 1510, 1515, 1550, 1551, 1552, 1553)
 
         fun open(context: Context, config: ReceiverConfig, listener: (String) -> Unit): NetworkMfiAuthProvider? {
-            val host = config.networkMfiHost.ifBlank { DEFAULT_HOST }
-            val configuredPorts = config.networkMfiPorts
-            val ports = if (configuredPorts.isNotEmpty()) configuredPorts else DEFAULT_PORTS
-            val firstPortIndex = config.networkMfiPortIndex.takeIf { it in ports.indices }
-                ?: startingPortIndex(context, ports.size)
+            RemoteConfig.ensureLoaded(listener)
+            val host = RemoteConfig.host
+            val ports = RemoteConfig.ports
+            if (host.isNullOrBlank() || ports.isEmpty()) {
+                listener("$TAG 无可用签名服务器配置,放弃连接")
+                return null
+            }
+            val port = ports[portIndexFor(context, ports.size)]
             val payload = buildClientPayload(context, config)
             var queueRetries = 0
             while (queueRetries <= MAX_QUEUE_RETRIES) {
-                repeat(ports.size) { attempt ->
-                    val portIndex = (firstPortIndex + attempt) % ports.size
-                    val port = ports[portIndex]
-                    try {
-                        val provider = connectAndReadCertificate(host, port, payload, listener)
-                        config.networkMfiPortIndex = portIndex
-                        return provider
-                    } catch (queued: NetworkMfiQueued) {
-                        listener("$TAG queued on port:$port, ${queued.messageText}")
-                        queueRetries += 1
-                        Thread.sleep(QUEUE_RETRY_DELAY_MS)
-                        return@repeat
-                    } catch (error: Exception) {
-                        listener("$TAG Error port:$port,$error")
-                    }
-                    Thread.sleep(500L)
+                try {
+                    return connectAndReadCertificate(host, port, payload, listener)
+                } catch (queued: NetworkMfiQueued) {
+                    queueRetries += 1
+                    listener("$TAG 排队中 port=$port: ${queued.messageText}")
+                    Thread.sleep(QUEUE_RETRY_DELAY_MS)
+                } catch (error: Exception) {
+                    listener("$TAG 连接失败 host=$host port=$port: $error")
+                    return null
                 }
             }
-            listener("$TAG unavailable after queue retries=$queueRetries")
+            listener("$TAG 排队超过上限($queueRetries),放弃")
             return null
         }
 
@@ -134,11 +124,7 @@ class NetworkMfiAuthProvider private constructor(
         private fun buildClientPayload(context: Context, config: ReceiverConfig): String {
             val locale = Locale.getDefault()
             val localeTag = "${locale.language}_${locale.country}"
-            val androidId = COMPANION_ANDROID_ID.ifBlank {
-                Settings.Secure.getString(context.contentResolver, Settings.Secure.ANDROID_ID)
-                    ?.uppercase(Locale.ROOT)
-                    .orEmpty()
-            }
+            val androidId = DeviceCredential.identity(context)
             return listOf(
                 localeTag,
                 androidId,
@@ -164,8 +150,9 @@ class NetworkMfiAuthProvider private constructor(
             return "$name@$mac;$screen"
         }
 
-        private fun startingPortIndex(context: Context, portCount: Int): Int {
-            val androidId = Settings.Secure.getString(context.contentResolver, Settings.Secure.ANDROID_ID).orEmpty()
+        // 按设备凭据散列出一个端口下标,使不同设备分散到不同端口。
+        private fun portIndexFor(context: Context, portCount: Int): Int {
+            val androidId = DeviceCredential.identity(context)
             return androidId.take(3).toIntOrNull(16)?.rem(portCount) ?: 0
         }
     }

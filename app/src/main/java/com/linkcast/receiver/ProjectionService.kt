@@ -21,7 +21,9 @@ import com.linkcast.receiver.media.AudioPipeline
 import com.linkcast.receiver.media.VideoPipeline
 import com.linkcast.receiver.nativebridge.NativeCallbackRegistry
 import com.linkcast.receiver.nativebridge.NativeCallbacks
+import com.linkcast.receiver.net.AirPlayAdvertiser
 import com.linkcast.receiver.net.HotspotProvider
+import com.linkcast.receiver.net.MdnsDiscovery
 import com.linkcast.receiver.transport.BtIap2Transport
 import com.linkcast.receiver.ui.MainActivity
 import java.nio.ByteBuffer
@@ -93,8 +95,8 @@ class ProjectionService : Service(), NativeCallbacks, BtIap2Transport.Listener {
 
     private lateinit var config: ReceiverConfig
     private lateinit var hotspotProvider: HotspotProvider
-    private lateinit var mdnsDiscovery: com.linkcast.receiver.net.MdnsDiscovery
-    private lateinit var airPlayAdvertiser: com.linkcast.receiver.net.AirPlayAdvertiser
+    private lateinit var mdnsDiscovery: MdnsDiscovery
+    private lateinit var airPlayAdvertiser: AirPlayAdvertiser
     private lateinit var transport: BtIap2Transport
     private lateinit var stateMachine: ProjectionStateMachine
     private lateinit var workerThread: HandlerThread
@@ -108,14 +110,20 @@ class ProjectionService : Service(), NativeCallbacks, BtIap2Transport.Listener {
     override fun onCreate() {
         super.onCreate()
         instance = this
+        // 解码器重建后(如从主页返回重新挂载 surface),请求发送端补发关键帧以恢复画面。
+        videoPipeline.onDecoderReady = {
+            log("解码器就绪,请求关键帧 forceKeyFrame(0)")
+            runCatching { CarplayNative.forceKeyFrame(0) }
+                .onFailure { log("forceKeyFrame 失败: $it") }
+        }
         config = ReceiverConfig(this)
         workerThread = HandlerThread("linkcast-service").also { it.start() }
         worker = Handler(workerThread.looper)
         hotspotProvider = HotspotProvider(this, config, { log(it) }) {
-            getString(com.linkcast.receiver.R.string.app_name)
+            getString(R.string.app_name)
         }
-        mdnsDiscovery = com.linkcast.receiver.net.MdnsDiscovery(this, "axb789") { log(it) }
-        airPlayAdvertiser = com.linkcast.receiver.net.AirPlayAdvertiser(this) { log(it) }
+        mdnsDiscovery = MdnsDiscovery(this, "axb789") { log(it) }
+        airPlayAdvertiser = AirPlayAdvertiser(this) { log(it) }
         authProvider = LocalMfiAuthProvider.open(this) { log(it) }
         transport = newTransport()
         stateMachine = ProjectionStateMachine(::onProjectionStateChanged) { cleanupForReconnect() }
@@ -247,17 +255,10 @@ class ProjectionService : Service(), NativeCallbacks, BtIap2Transport.Listener {
         }
         publishPhase("连接中(认证)…", true)
         ensureAuthProvider()
-        // Bring the AP up now (the MFi handshake above already grabbed its signature
-        // and STA+AP run concurrently on this radio) so the LocalOnlyHotspot's real
-        // credentials are published BEFORE the phone asks for the Wi-Fi config right
-        // after auth — otherwise it joins with the stale placeholder creds and fails.
+        // 在手机请求 Wi-Fi 配置之前先把热点起好并发布真实凭据,否则手机会拿到占位凭据连接失败。
         hotspotProvider.ensureStarted()
-        // Match the reference threading: the native engine (setWifiConfiguration +
-        // setResolutions + start with the MFi cert) is initialised on the MAIN looper
-        // thread (original runs it on the CarplayService Handler), and BLOCKS until
-        // done; only then does the Bluetooth thread create the iAP2 link and feed
-        // income_data. Running start() on the rfcomm thread (as before) left the
-        // native session with the wrong thread affinity -> Iap2Link+0x40 dangling.
+        // 原生引擎(setWifiConfiguration + setResolutions + start)在主 looper 线程初始化并阻塞至完成,
+        // 之后蓝牙线程才创建 iAP2 链路并喂 income_data;线程亲和性不对会导致原生会话崩溃。
         ensureNativeEngineStarted()
         transport.startAutoConnect()
     }
@@ -271,11 +272,14 @@ class ProjectionService : Service(), NativeCallbacks, BtIap2Transport.Listener {
         val certificate = loadMfiCertificate()
         val latch = java.util.concurrent.CountDownLatch(1)
         mainHandler.post {
+            val resolution = config.selectedResolution()
+            ProjectionMetrics.update(resolution.x, resolution.y)
+            videoPipeline.setVideoSize(resolution.x, resolution.y)
             val payload = config.resolutionPayload()
             CarplayNative.configureResolutions(payload.resolutions, payload.count, payload.options)
             CarplayNative.setWifiConfiguration(
                 config.hotspotSsidFallback, config.hotspotPasswordFallback,
-                36, 4, getString(com.linkcast.receiver.R.string.app_name), "", ""
+                36, 4, getString(R.string.app_name), "", ""
             )
             // Offline the native layer self-provides its built-in MFi identity and
             // self-signs; supplying an externally-sourced certificate here pairs a
@@ -433,7 +437,7 @@ class ProjectionService : Service(), NativeCallbacks, BtIap2Transport.Listener {
         val manager = getSystemService(NotificationManager::class.java)
         if (Build.VERSION.SDK_INT >= 26) {
             manager.createNotificationChannel(
-                NotificationChannel(CHANNEL_ID, getString(com.linkcast.receiver.R.string.notification_channel), NotificationManager.IMPORTANCE_LOW)
+                NotificationChannel(CHANNEL_ID, getString(R.string.notification_channel), NotificationManager.IMPORTANCE_LOW)
             )
         }
         val pendingIntent = PendingIntent.getActivity(
@@ -445,8 +449,8 @@ class ProjectionService : Service(), NativeCallbacks, BtIap2Transport.Listener {
         return if (Build.VERSION.SDK_INT >= 26) {
             Notification.Builder(this, CHANNEL_ID)
                 .setSmallIcon(android.R.drawable.stat_sys_data_bluetooth)
-                .setContentTitle(getString(com.linkcast.receiver.R.string.notification_title))
-                .setContentText(getString(com.linkcast.receiver.R.string.notification_text))
+                .setContentTitle(getString(R.string.notification_title))
+                .setContentText(getString(R.string.notification_text))
                 .setContentIntent(pendingIntent)
                 .setOngoing(true)
                 .build()
@@ -454,8 +458,8 @@ class ProjectionService : Service(), NativeCallbacks, BtIap2Transport.Listener {
             @Suppress("DEPRECATION")
             Notification.Builder(this)
                 .setSmallIcon(android.R.drawable.stat_sys_data_bluetooth)
-                .setContentTitle(getString(com.linkcast.receiver.R.string.notification_title))
-                .setContentText(getString(com.linkcast.receiver.R.string.notification_text))
+                .setContentTitle(getString(R.string.notification_title))
+                .setContentText(getString(R.string.notification_text))
                 .setContentIntent(pendingIntent)
                 .setOngoing(true)
                 .build()
