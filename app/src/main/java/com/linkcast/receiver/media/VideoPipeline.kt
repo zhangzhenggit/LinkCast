@@ -37,6 +37,23 @@ class VideoPipeline {
     // 解码器(重新)挂到屏上 Surface 后回调,用于请求一个关键帧,使新画面尽快刷新。
     @Volatile var onDecoderReady: (() -> Unit)? = null
 
+    // 解码器致命失败(创建失败或解码抛 CodecException)回调,参数为失败时是否为 HEVC。
+    // 上层据此做码型回退;同一会话只回调一次。
+    @Volatile var onDecoderFatal: ((wasHevc: Boolean) -> Unit)? = null
+    @Volatile private var fatalReported = false
+
+    // 设置使用的视频码型(由协商决策传入,与发送端一致)。true=HEVC,false=H.264。
+    fun setCodec(hevc: Boolean) {
+        handler.post {
+            val newMime = if (hevc) MIME_HEVC else MIME_AVC
+            if (newMime != mime) {
+                mime = newMime
+                fatalReported = false
+                if (codec != null) rebuildDecoder()
+            }
+        }
+    }
+
     fun setSurface(surface: Surface?, width: Int, height: Int) {
         handler.post {
             realSurface = surface
@@ -93,6 +110,10 @@ class VideoPipeline {
                     decoder.queueInputBuffer(inputIndex, 0, size, 0L, mediaCodecFlags(flags))
                 }
                 drainOutput(decoder)
+            } catch (error: MediaCodec.CodecException) {
+                // 解码器无法解当前码流(常见于车机号称支持 HEVC 实际解不动)→ 上报致命失败,由上层回退码型。
+                LinkLog.w(TAG) { "解码异常($mime): $error" }
+                reportFatal()
             } catch (error: Exception) {
                 LinkLog.w(TAG) { "解码帧失败,重建解码器: $error" }
                 rebuildDecoder()
@@ -128,12 +149,16 @@ class VideoPipeline {
 
     private fun rebuildDecoder(): MediaCodec? {
         releaseDecoder()
-        val target = outputSurface()
-        return createDecoder(mime, target) ?: run {
-            // 当前编码格式建不出解码器时,切到另一种常见 CarPlay 编码再试一次。
-            mime = if (mime == MIME_HEVC) MIME_AVC else MIME_HEVC
-            createDecoder(mime, target)
-        }
+        // 码型由协商决定,解码器必须与之一致,故不在本地盲目互换;建不出即上报致命失败,由上层回退码型并重连。
+        val decoder = createDecoder(mime, outputSurface())
+        if (decoder == null) reportFatal()
+        return decoder
+    }
+
+    private fun reportFatal() {
+        if (fatalReported) return
+        fatalReported = true
+        onDecoderFatal?.invoke(mime == MIME_HEVC)
     }
 
     private fun createDecoder(mime: String, surface: Surface): MediaCodec? = runCatching {

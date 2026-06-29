@@ -5,14 +5,25 @@ import android.content.SharedPreferences
 import android.graphics.Point
 import android.util.DisplayMetrics
 import android.view.WindowManager
+import androidx.core.content.edit
+import com.linkcast.receiver.media.CodecSupport
 
 class LinkConfig(context: Context) {
     private val appContext: Context = context.applicationContext
     private val prefs: SharedPreferences = appContext.getSharedPreferences(Prefs.CONFIG, Context.MODE_PRIVATE)
 
     val audioBuffers: Int get() = prefs.getInt("key_audio_buffers", 30)
-    val codecType: Int get() = prefs.getInt("key_codec_type", 1)
     val videoCorner: Int get() = prefs.getInt("key_videostream_corner", 0)
+
+    // HEVC 是否已被实测证明解不动(被动回退置位,持久化)。
+    private val hevcFailed: Boolean get() = prefs.getInt("codec_hevc_failed", 0) > 0
+
+    fun markHevcFailed() = prefs.edit { putInt("codec_hevc_failed", 1) }
+
+    // 本次会话使用的视频码型:1=HEVC,0=H.264。
+    // 本机有 HEVC 解码器且未实测崩过 → HEVC;否则 H.264。协商与解码器共用此决策,确保一致。
+    fun effectiveCodecType(): Int =
+        if (CodecSupport.hevcDecoderAvailable() && !hevcFailed) CODEC_HEVC else CODEC_H264
     val density: Int get() = prefs.getInt("key_density", 0)
     val hotspotSsidFallback: String get() = prefs.getString("etx_wifi_name", "car") ?: "car"
     val hotspotPasswordFallback: String get() = prefs.getString("etx_wifi_pswd", "12345678") ?: "12345678"
@@ -77,7 +88,7 @@ class LinkConfig(context: Context) {
         val options = intArrayOf(
             target.x / 6,
             target.y / 6,
-            (if (videoCorner == 0) 0 else 2) or codecType
+            (if (videoCorner == 0) 0 else 2) or effectiveCodecType()
         )
         return ResolutionPayload(resolutions, resolutions.size, options)
     }
@@ -94,6 +105,10 @@ class LinkConfig(context: Context) {
         // 热点后端取值。
         const val HOTSPOT_WIFI_DIRECT = 0
         const val HOTSPOT_MANUAL = 2
+
+        // 视频码型取值(对应 options 编解码位)。
+        const val CODEC_H264 = 0
+        const val CODEC_HEVC = 1
     }
 }
 

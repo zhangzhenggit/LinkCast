@@ -20,6 +20,7 @@ import com.linkcast.receiver.diag.LinkLog
 import com.linkcast.receiver.auth.LocalMfiAuthProvider
 import com.linkcast.receiver.auth.NetworkMfiAuthProvider
 import com.linkcast.receiver.media.AudioPipeline
+import com.linkcast.receiver.media.CodecSupport
 import com.linkcast.receiver.media.VideoPipeline
 import com.linkcast.receiver.nativebridge.NativeCallbackRegistry
 import com.linkcast.receiver.nativebridge.NativeCallbacks
@@ -119,6 +120,8 @@ class ProjectionService : Service(), NativeCallbacks, BtIap2Transport.Listener {
             runCatching { CarplayNative.forceKeyFrame(1) }
                 .onFailure { log("forceKeyFrame 失败: $it") }
         }
+        // HEVC 解码致命失败 → 持久化标记 + 提示 + 重连改用 H.264。
+        videoPipeline.onDecoderFatal = { wasHevc -> worker.post { handleDecoderFatal(wasHevc) } }
         config = LinkConfig(this)
         LinkLog.enabled = config.diagLogEnabled
         workerThread = HandlerThread("linkcast-service").also { it.start() }
@@ -279,6 +282,10 @@ class ProjectionService : Service(), NativeCallbacks, BtIap2Transport.Listener {
             val resolution = config.selectedResolution()
             ProjectionMetrics.update(resolution.x, resolution.y)
             videoPipeline.setVideoSize(resolution.x, resolution.y)
+            // 码型决策(协商与解码器共用):有 HEVC 解码器且未崩过 → HEVC,否则 H.264。
+            val codecHevc = config.effectiveCodecType() == LinkConfig.CODEC_HEVC
+            videoPipeline.setCodec(codecHevc)
+            log("码型决策=${if (codecHevc) "HEVC" else "H.264"} 本机HEVC解码器=${CodecSupport.hevcDecoderAvailable()}")
             val payload = config.resolutionPayload()
             CarplayNative.configureResolutions(payload.resolutions, payload.count, payload.options)
             // 启动前写入占位热点凭据,真实凭据在热点就绪后由 HotspotProvider 覆盖。
@@ -475,9 +482,35 @@ class ProjectionService : Service(), NativeCallbacks, BtIap2Transport.Listener {
     }
 
     // 热点并发冲突等非致命提示:记录日志并弹 Toast,不打断本次连接。
-    private fun showHotspotWarning(message: String) {
+    private fun showHotspotWarning(message: String) = toast(message)
+
+    private fun toast(message: String) {
         log(message)
         mainHandler.post { runCatching { Toast.makeText(this, message, Toast.LENGTH_LONG).show() } }
+    }
+
+    // HEVC 解码致命失败时回退到 H.264:持久化标记、提示、重连一次。
+    private fun handleDecoderFatal(wasHevc: Boolean) {
+        // 只处理 HEVC 失败;若已回退则忽略后续重复回调。
+        if (!wasHevc || config.effectiveCodecType() != LinkConfig.CODEC_HEVC) return
+        config.markHevcFailed()
+        toast("HEVC 解码失败,已切换 H.264")
+        reconnectForCodecChange()
+    }
+
+    // 停掉当前会话(含原生引擎)并重新发起连接,使新的码型决策(H.264)在协商时生效。
+    private fun reconnectForCodecChange() {
+        log("码型回退,重新连接以改用 H.264")
+        transport.stop()
+        mdnsDiscovery.stop()
+        airPlayAdvertiser.stop()
+        abandonAudioFocus()
+        hotspotProvider.stop()
+        stateMachine.reset()
+        runCatching { CarplayNative.stop() }
+        CarplayNative.markNativeStopped()
+        transport = newTransport()
+        startConnectionSequence()
     }
 
     private fun publishPhase(phase: String, connecting: Boolean) {
