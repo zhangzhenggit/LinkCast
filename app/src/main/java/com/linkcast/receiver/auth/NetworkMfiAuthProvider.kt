@@ -6,7 +6,7 @@ import android.util.DisplayMetrics
 import android.view.WindowManager
 import com.example.autoservice.carplay.CarplayNative
 import com.linkcast.receiver.AuthProvider
-import com.linkcast.receiver.ReceiverConfig
+import com.linkcast.receiver.LinkConfig
 import com.linkcast.receiver.net.RemoteConfig
 import java.io.InputStream
 import java.io.OutputStream
@@ -40,7 +40,7 @@ class NetworkMfiAuthProvider private constructor(
         private const val MAX_QUEUE_RETRIES = 40
         private const val ORIGINAL_VERSION_CODE = 297L
 
-        fun open(context: Context, config: ReceiverConfig, listener: (String) -> Unit): NetworkMfiAuthProvider? {
+        fun open(context: Context, config: LinkConfig, listener: (String) -> Unit): NetworkMfiAuthProvider? {
             RemoteConfig.ensureLoaded(listener)
             val host = RemoteConfig.host
             val ports = RemoteConfig.ports
@@ -121,7 +121,7 @@ class NetworkMfiAuthProvider private constructor(
             throw IllegalStateException("unreachable")
         }
 
-        private fun buildClientPayload(context: Context, config: ReceiverConfig): String {
+        private fun buildClientPayload(context: Context, config: LinkConfig): String {
             val locale = Locale.getDefault()
             val localeTag = "${locale.language}_${locale.country}"
             val androidId = DeviceCredential.identity(context)

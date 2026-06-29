@@ -14,7 +14,9 @@ import android.os.IBinder
 import android.os.Looper
 import android.util.Log
 import android.view.Surface
+import android.widget.Toast
 import com.example.autoservice.carplay.CarplayNative
+import com.linkcast.receiver.diag.LinkLog
 import com.linkcast.receiver.auth.LocalMfiAuthProvider
 import com.linkcast.receiver.auth.NetworkMfiAuthProvider
 import com.linkcast.receiver.media.AudioPipeline
@@ -93,7 +95,7 @@ class ProjectionService : Service(), NativeCallbacks, BtIap2Transport.Listener {
         }
     }
 
-    private lateinit var config: ReceiverConfig
+    private lateinit var config: LinkConfig
     private lateinit var hotspotProvider: HotspotProvider
     private lateinit var mdnsDiscovery: MdnsDiscovery
     private lateinit var airPlayAdvertiser: AirPlayAdvertiser
@@ -116,10 +118,11 @@ class ProjectionService : Service(), NativeCallbacks, BtIap2Transport.Listener {
             runCatching { CarplayNative.forceKeyFrame(0) }
                 .onFailure { log("forceKeyFrame 失败: $it") }
         }
-        config = ReceiverConfig(this)
+        config = LinkConfig(this)
+        LinkLog.enabled = config.diagLogEnabled
         workerThread = HandlerThread("linkcast-service").also { it.start() }
         worker = Handler(workerThread.looper)
-        hotspotProvider = HotspotProvider(this, config, { log(it) }) {
+        hotspotProvider = HotspotProvider(this, config, { showHotspotWarning(it) }) {
             getString(R.string.app_name)
         }
         mdnsDiscovery = MdnsDiscovery(this, "axb789") { log(it) }
@@ -277,10 +280,8 @@ class ProjectionService : Service(), NativeCallbacks, BtIap2Transport.Listener {
             videoPipeline.setVideoSize(resolution.x, resolution.y)
             val payload = config.resolutionPayload()
             CarplayNative.configureResolutions(payload.resolutions, payload.count, payload.options)
-            CarplayNative.setWifiConfiguration(
-                config.hotspotSsidFallback, config.hotspotPasswordFallback,
-                36, 4, getString(R.string.app_name), "", ""
-            )
+            // 启动前写入占位热点凭据,真实凭据在热点就绪后由 HotspotProvider 覆盖。
+            hotspotProvider.publishPlaceholder()
             // Offline the native layer self-provides its built-in MFi identity and
             // self-signs; supplying an externally-sourced certificate here pairs a
             // cert with the wrong signing key and the device rejects auth. Only pass
@@ -470,6 +471,12 @@ class ProjectionService : Service(), NativeCallbacks, BtIap2Transport.Listener {
         Log.d(TAG, message)
         val l = statusListener ?: return
         mainHandler.post { runCatching { l.onLog(message) } }
+    }
+
+    // 热点并发冲突等非致命提示:记录日志并弹 Toast,不打断本次连接。
+    private fun showHotspotWarning(message: String) {
+        log(message)
+        mainHandler.post { runCatching { Toast.makeText(this, message, Toast.LENGTH_LONG).show() } }
     }
 
     private fun publishPhase(phase: String, connecting: Boolean) {

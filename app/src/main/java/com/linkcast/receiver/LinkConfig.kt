@@ -6,7 +6,7 @@ import android.graphics.Point
 import android.util.DisplayMetrics
 import android.view.WindowManager
 
-class ReceiverConfig(context: Context) {
+class LinkConfig(context: Context) {
     private val appContext: Context = context.applicationContext
     private val prefs: SharedPreferences = appContext.getSharedPreferences(Prefs.CONFIG, Context.MODE_PRIVATE)
 
@@ -16,14 +16,15 @@ class ReceiverConfig(context: Context) {
     val density: Int get() = prefs.getInt("key_density", 0)
     val hotspotSsidFallback: String get() = prefs.getString("etx_wifi_name", "car") ?: "car"
     val hotspotPasswordFallback: String get() = prefs.getString("etx_wifi_pswd", "12345678") ?: "12345678"
-    val useFiveGhz: Boolean get() = prefs.getInt("etx_wifi_band", 1) > 0
-    // When true, do NOT start a LocalOnlyHotspot — rely on a user-managed system "car"
-    // AP and just advertise its static creds. This matches how the original works on
-    // this tablet: the AP is the SYSTEM tethering hotspot (its 2.4/5GHz band is chosen
-    // by the user in Android hotspot settings), and the app only announces the channel.
-    // LocalOnlyHotspot's band is system-random (often 2.4GHz) and unforceable, so manual
-    // is the reliable, band-controllable path. Default ON.
-    val manualHotspot: Boolean get() = prefs.getInt("manual_hotspot", 1) > 0
+    // 手动模式下使用 5G 频段。默认 2.4G。
+    val useFiveGhz: Boolean get() = prefs.getInt("etx_wifi_band", 0) > 0
+    // 热点后端:
+    //   0 = Wi-Fi Direct(P2P GO,默认):普通权限即可指定 5G 频段。
+    //   2 = 手动(广告静态凭据,连接外部已开好的 AP),仅调试对照用。
+    val hotspotMode: Int get() = prefs.getInt("hotspot_mode", HOTSPOT_WIFI_DIRECT)
+
+    // 调试日志总开关。开启后项目自定义日志(经 LinkLog)才会输出。
+    val diagLogEnabled: Boolean get() = prefs.getInt("diag_log", 1) > 0
     val hotspotChannel: Int get() = prefs.getInt("etx_wifi_channel", 0)
     val autoConnect: Boolean get() = prefs.getInt("key_auto_connect", 1) > 0
     val defaultBluetoothAddress: String get() = prefs.getString("key_default_btdevice", "").orEmpty()
@@ -31,6 +32,10 @@ class ReceiverConfig(context: Context) {
 
     // 投屏分辨率。已显式配置则用配置值,否则取屏幕实际尺寸(横向为宽)。
     fun selectedResolution(): Point {
+        // 测试开关:固定分辨率,用于验证卡顿是否与分辨率相关。两值 >0 时生效,设回 0 则走自适应。
+        if (TEST_FORCE_WIDTH > 0 && TEST_FORCE_HEIGHT > 0) {
+            return Point(TEST_FORCE_WIDTH and -2, TEST_FORCE_HEIGHT and -2)
+        }
         val parts = prefs.getString("key_set_resolutions", "").orEmpty()
             .split(",", "x", ";")
             .mapNotNull { it.trim().toIntOrNull() }
@@ -81,6 +86,14 @@ class ReceiverConfig(context: Context) {
         // CarPlay 投屏分辨率上限。
         private const val MAX_WIDTH = 1920
         private const val MAX_HEIGHT = 1080
+
+        // 测试用固定分辨率(设回 0 关闭,恢复自适应)。
+        private const val TEST_FORCE_WIDTH = 0
+        private const val TEST_FORCE_HEIGHT = 0
+
+        // 热点后端取值。
+        const val HOTSPOT_WIFI_DIRECT = 0
+        const val HOTSPOT_MANUAL = 2
     }
 }
 

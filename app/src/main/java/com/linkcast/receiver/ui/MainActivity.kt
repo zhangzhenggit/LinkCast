@@ -9,6 +9,8 @@ import android.graphics.SurfaceTexture
 import android.view.Gravity
 import android.view.KeyEvent
 import android.view.Surface
+import android.view.SurfaceHolder
+import android.view.SurfaceView
 import android.view.TextureView
 import android.view.View
 import android.view.ViewGroup
@@ -23,9 +25,13 @@ import android.widget.TextView
 import com.linkcast.receiver.ProjectionService
 import com.linkcast.receiver.input.InputForwarder
 
-class MainActivity : Activity(), TextureView.SurfaceTextureListener, ProjectionService.StatusListener {
+class MainActivity : Activity(),
+    TextureView.SurfaceTextureListener,
+    SurfaceHolder.Callback,
+    ProjectionService.StatusListener {
+
     private val inputForwarder = InputForwarder()
-    private lateinit var textureView: TextureView
+    private lateinit var videoView: View
     private var surface: Surface? = null
     private lateinit var phaseView: TextView
     private lateinit var logView: TextView
@@ -36,17 +42,20 @@ class MainActivity : Activity(), TextureView.SurfaceTextureListener, ProjectionS
 
     private val logLines = ArrayDeque<String>()
 
+    companion object {
+        // 渲染视图选择:
+        // true  = SurfaceView,硬件 overlay 零拷贝、最跟手,但切后台 surface 销毁,回主页再进会短暂黑屏;
+        // false = TextureView,走 GPU 合成多一次拷贝,高分辨率下更易卡顿,但切后台不销毁、回前台无缝。
+        // 当前用于对比验证卡顿是否由 TextureView 引入。
+        private const val RENDER_WITH_SURFACE_VIEW = false
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enterFullscreen()
         requestRuntimePermissions()
 
-        textureView = TextureView(this).apply {
-            surfaceTextureListener = this@MainActivity
-            isFocusable = true
-            isFocusableInTouchMode = true
-            setOnTouchListener { view, event -> inputForwarder.onTouch(view, event) }
-        }
+        videoView = createVideoView()
 
         phaseView = TextView(this).apply {
             text = "极连投屏 LinkCast — 空闲"
@@ -93,7 +102,7 @@ class MainActivity : Activity(), TextureView.SurfaceTextureListener, ProjectionS
 
         setContentView(FrameLayout(this).apply {
             setBackgroundColor(0xff111318.toInt())
-            addView(textureView, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
+            addView(videoView, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
             addView(panel, FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.TOP or Gravity.START))
             addView(toggleButton, FrameLayout.LayoutParams(120, 120, Gravity.TOP or Gravity.END))
         })
@@ -105,8 +114,9 @@ class MainActivity : Activity(), TextureView.SurfaceTextureListener, ProjectionS
     override fun onResume() {
         super.onResume()
         ProjectionService.statusListener = this
-        // SurfaceTexture 在切后台时不销毁;回前台若已存在则重新挂载到投屏。
-        surface?.let { ProjectionService.attachSurface(it, textureView.width, textureView.height) }
+        // TextureView 的 SurfaceTexture 切后台不销毁,回前台若已存在则重新挂载;
+        // SurfaceView 切后台会销毁 surface,由 surfaceCreated 重新挂载,这里 surface 为 null 不重复挂。
+        surface?.let { ProjectionService.attachSurface(it, videoView.width, videoView.height) }
         // Render the latest known phase immediately on (re)bind.
         onPhase(ProjectionService.lastPhase, ProjectionService.isConnecting)
     }
@@ -138,6 +148,32 @@ class MainActivity : Activity(), TextureView.SurfaceTextureListener, ProjectionS
         surface?.release()
         surface = null
         super.onDestroy()
+    }
+
+    // 按开关创建渲染视图,两种实现的触控/焦点配置一致。
+    private fun createVideoView(): View {
+        val view: View = if (RENDER_WITH_SURFACE_VIEW) {
+            SurfaceView(this).also { it.holder.addCallback(this) }
+        } else {
+            TextureView(this).also { it.surfaceTextureListener = this }
+        }
+        view.isFocusable = true
+        view.isFocusableInTouchMode = true
+        view.setOnTouchListener { v, event -> inputForwarder.onTouch(v, event) }
+        return view
+    }
+
+    // SurfaceView 回调。surface 由系统创建/销毁,切后台销毁后回前台重建(回主页再进会短暂黑屏)。
+    override fun surfaceCreated(holder: SurfaceHolder) {}
+
+    override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {
+        surface = holder.surface
+        ProjectionService.attachSurface(surface, width, height)
+    }
+
+    override fun surfaceDestroyed(holder: SurfaceHolder) {
+        surface = null
+        ProjectionService.attachSurface(null, 0, 0)
     }
 
     override fun onSurfaceTextureAvailable(texture: SurfaceTexture, width: Int, height: Int) {

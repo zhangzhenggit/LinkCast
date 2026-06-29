@@ -1,116 +1,84 @@
 package com.linkcast.receiver.net
 
 import android.content.Context
-import android.net.wifi.WifiManager
-import android.os.Build
-import android.os.Handler
-import android.os.HandlerThread
-import android.util.Log
 import com.example.autoservice.carplay.CarplayNative
-import com.linkcast.receiver.ReceiverConfig
+import com.linkcast.receiver.LinkConfig
+import com.linkcast.receiver.diag.LinkLog
 
 /**
- * Brings up a Wi-Fi access point the phone can join for the projection video link.
+ * 准备投屏所需的 Wi-Fi 接入点,并把其 SSID/密码/信道交给原生层;iPhone 通过(已认证的)
+ * 控制通道拿到这组凭据后据此关联。
  *
- * The phone is told the AP credentials over the (already authenticated) control
- * channel and then associates to that AP. The credentials MUST be those of an AP
- * that is actually running, so we start a LocalOnlyHotspot and read back the
- * system-assigned SSID/passphrase, then publish exactly those to the native layer.
+ * 默认使用 Wi-Fi Direct 自建组([P2pGroupHotspot]):普通应用权限即可指定 5G 频段。
+ * 手动后端([ManualAp])仅用于调试对照,默认不启用。
  */
 class HotspotProvider(
     private val context: Context,
-    private val config: ReceiverConfig,
-    private val listener: (String) -> Unit,
+    private val config: LinkConfig,
+    private val warn: (String) -> Unit,
     private val deviceName: () -> String,
 ) {
-    private val wifiManager =
-        context.applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
-    private val thread = HandlerThread("linkcast-hotspot").also { it.start() }
-    private val handler = Handler(thread.looper)
+    private val p2p = P2pGroupHotspot(context, warn)
+    @Volatile private var p2pCreds: Pair<String, String>? = null
 
-    @Volatile private var reservation: WifiManager.LocalOnlyHotspotReservation? = null
-    @Volatile private var starting = false
+    private val manualAp = ManualAp(config.hotspotSsidFallback, config.hotspotPasswordFallback)
 
     fun ensureStarted() {
-        // Manual mode: the user runs a "car" AP themselves; never touch the radio (a
-        // LocalOnlyHotspot attempt fails when tethering is active and can disrupt Wi-Fi).
-        // Just advertise the static creds so the phone joins the user's AP.
-        if (config.manualHotspot) {
-            publishStatic()
-            return
-        }
-        if (reservation != null || starting) {
-            // Already up — re-publish current creds so a late WiFi request is answered.
-            reservation?.let { publish(it) }
-            return
-        }
-        starting = true
-        listener("Starting local-only hotspot")
-        runCatching {
-            wifiManager.startLocalOnlyHotspot(object : WifiManager.LocalOnlyHotspotCallback() {
-                override fun onStarted(res: WifiManager.LocalOnlyHotspotReservation) {
-                    reservation = res
-                    starting = false
-                    publish(res)
-                }
-
-                override fun onFailed(reason: Int) {
-                    starting = false
-                    listener("Local-only hotspot failed reason=$reason")
-                    // Fall back to the configured static creds so a manually
-                    // pre-provisioned AP can still be advertised to the phone.
-                    publishStatic()
-                }
-
-                override fun onStopped() {
-                    reservation = null
-                    starting = false
-                    listener("Local-only hotspot stopped")
-                }
-            }, handler)
-        }.onFailure {
-            starting = false
-            listener("startLocalOnlyHotspot threw: $it; using static creds")
-            publishStatic()
+        when (config.hotspotMode) {
+            LinkConfig.HOTSPOT_MANUAL -> publishManual()
+            else -> ensureWifiDirect()
         }
     }
 
-    fun stop() {
-        runCatching { reservation?.close() }
-        reservation = null
-        starting = false
+    // Wi-Fi Direct 建组是异步的:组就绪前先把上次缓存的凭据顶上,就绪回调里再用真实凭据覆盖。
+    private fun ensureWifiDirect() {
+        p2pCreds?.let { publishCredentials(it.first, it.second) }
+        p2p.start { ssid, pass ->
+            p2pCreds = ssid to pass
+            publishCredentials(ssid, pass)
+        }
     }
 
-    private fun publish(res: WifiManager.LocalOnlyHotspotReservation) {
-        val ssid: String
-        val pass: String
-        if (Build.VERSION.SDK_INT >= 30) {
-            val cfg = res.softApConfiguration
-            ssid = cfg.ssid?.removeSurrounding("\"").orEmpty()
-            pass = cfg.passphrase.orEmpty()
-        } else {
-            @Suppress("DEPRECATION")
-            val wc = res.wifiConfiguration
-            ssid = wc?.SSID?.removeSurrounding("\"").orEmpty()
-            @Suppress("DEPRECATION")
-            pass = wc?.preSharedKey?.removeSurrounding("\"").orEmpty()
-        }
+    private fun publishManual() {
+        val (ssid, pass) = manualAp.credentials()
         publishCredentials(ssid, pass)
     }
 
-    private fun publishStatic() {
+    // 原生引擎启动前先写入一组占位凭据(真实凭据在热点就绪后覆盖),让其顺利完成初始化。
+    fun publishPlaceholder() {
         publishCredentials(config.hotspotSsidFallback, config.hotspotPasswordFallback)
     }
 
+    fun stop() {
+        runCatching { p2p.stop() }
+        p2pCreds = null
+    }
+
     private fun publishCredentials(ssid: String, pass: String) {
-        val channel = when {
-            config.hotspotChannel > 0 -> config.hotspotChannel
-            config.useFiveGhz -> 36
-            else -> 1
-        }
-        Log.d("HotspotProvider", "Publishing hotspot ssid=$ssid channel=$channel")
-        listener("Publishing hotspot credentials ssid=$ssid channel=$channel")
-        // Mirrors the reference call: (ssid, passphrase, channel, 4, deviceName, "", "").
+        val channel = chooseChannel()
+        LinkLog.d(TAG) { "上报热点凭据 ssid=$ssid channel=$channel" }
+        // 对应原始调用:(ssid, passphrase, channel, 4, deviceName, "", "")。
         CarplayNative.setWifiConfiguration(ssid, pass, channel, 4, deviceName(), "", "")
+    }
+
+    // 选择上报给 iPhone 的信道。iPhone 拿到凭据后只按 SSID 在对应频段内扫描关联,
+    // 信道不必与热点实际信道精确一致,只要频段(2.4G/5G)对得上即可关联(已实测验证)。
+    private fun chooseChannel(): Int {
+        if (config.hotspotChannel > 0) return config.hotspotChannel
+        return when (config.hotspotMode) {
+            // 手动后端:广告频段需与外部 AP 的实际频段一致。
+            LinkConfig.HOTSPOT_MANUAL ->
+                if (config.useFiveGhz) DEFAULT_5G_CHANNEL else DEFAULT_2G_CHANNEL
+            // Wi-Fi Direct 建组优先请求 5G,故上报 5G 信道。
+            else -> DEFAULT_5G_CHANNEL
+        }
+    }
+
+    companion object {
+        private const val TAG = "HotspotProvider"
+        // 缺省 2.4G 信道(覆盖广、各区域通用)。
+        private const val DEFAULT_2G_CHANNEL = 6
+        // 缺省 5G 信道。
+        private const val DEFAULT_5G_CHANNEL = 36
     }
 }
