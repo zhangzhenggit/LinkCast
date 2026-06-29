@@ -27,7 +27,9 @@ class P2pGroupHotspot(
     private val warn: (String) -> Unit,
 ) {
     private val manager = context.getSystemService(Context.WIFI_P2P_SERVICE) as? WifiP2pManager
+    // channel 只初始化一次并全程复用:反复 initialize 会让框架状态错乱,导致 createGroup 报 ERROR。
     private var channel: WifiP2pManager.Channel? = null
+    private var receiverRegistered = false
 
     @Volatile private var onReady: ((String, String) -> Unit)? = null
     @Volatile private var started = false
@@ -45,23 +47,16 @@ class P2pGroupHotspot(
     @SuppressLint("MissingPermission")
     fun start(onReady: (String, String) -> Unit) {
         val mgr = manager ?: run { LinkLog.w(TAG) { "本机不支持 Wi-Fi P2P" }; return }
+        this.onReady = onReady
+        val ch = ensureChannel(mgr) ?: run { LinkLog.w(TAG) { "Wi-Fi P2P channel 不可用" }; return }
         if (started) {
             // 已在运行:再拉一次组信息,补答一次凭据。
             requestGroupInfo()
             return
         }
         started = true
-        this.onReady = onReady
         logEnvDiagnostics()
         warnIfStaConflict()
-        channel = mgr.initialize(context, Looper.getMainLooper(), null)
-        ContextCompat.registerReceiver(
-            context,
-            receiver,
-            IntentFilter(WifiP2pManager.WIFI_P2P_CONNECTION_CHANGED_ACTION),
-            ContextCompat.RECEIVER_NOT_EXPORTED,
-        )
-        val ch = channel ?: return
         // 若系统里已存在我们自己的组(上次未正常 stop 残留)则直接复用,避免 remove 异步未完成时
         // 紧接着 createGroup 撞上残留组报 BUSY、逐级失败卡死。无我们的组时再清残留并新建。
         mgr.requestGroupInfo(ch) { group ->
@@ -173,15 +168,45 @@ class P2pGroupHotspot(
         return if (freq > 0) freq else 0
     }
 
+    // 初始化并复用同一个 channel(只在首次或断开后重建);顺带注册一次组状态广播。
+    private fun ensureChannel(mgr: WifiP2pManager): WifiP2pManager.Channel? {
+        channel?.let { return it }
+        val ch = mgr.initialize(context, Looper.getMainLooper()) {
+            // 框架断开 channel(如 WiFi 重置):清空,下次 ensureChannel 重建。
+            LinkLog.w(TAG) { "Wi-Fi P2P channel 断开" }
+            channel = null
+        }
+        channel = ch
+        if (ch != null && !receiverRegistered) {
+            ContextCompat.registerReceiver(
+                context,
+                receiver,
+                IntentFilter(WifiP2pManager.WIFI_P2P_CONNECTION_CHANGED_ACTION),
+                ContextCompat.RECEIVER_NOT_EXPORTED,
+            )
+            receiverRegistered = true
+        }
+        return ch
+    }
+
+    // 停止当前组(下次 start 会重建),但保留 channel 与广播注册以便复用。
     fun stop() {
         val mgr = manager
         val ch = channel
-        runCatching { context.unregisterReceiver(receiver) }
         if (mgr != null && ch != null) {
             runCatching { mgr.removeGroup(ch, null) }
         }
         started = false
         onReady = null
+    }
+
+    // 彻底释放(服务销毁时调用):移除组、注销广播。
+    fun release() {
+        stop()
+        if (receiverRegistered) {
+            runCatching { context.unregisterReceiver(receiver) }
+            receiverRegistered = false
+        }
     }
 
     companion object {

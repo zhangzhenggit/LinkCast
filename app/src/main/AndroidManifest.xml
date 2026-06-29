@@ -40,7 +40,7 @@
         </activity>
 
         <service
-            android:name=".ProjectionService"
+            android:name=".CarPlayService"
             android:exported="false"
             android:foregroundServiceType="connectedDevice" />
 

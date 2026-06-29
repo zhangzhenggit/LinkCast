@@ -54,6 +54,12 @@ class HotspotProvider(
         p2pCreds = null
     }
 
+    // 彻底释放(服务销毁时):移除组并注销 P2P 广播。
+    fun release() {
+        runCatching { p2p.release() }
+        p2pCreds = null
+    }
+
     private fun publishCredentials(ssid: String, pass: String) {
         val channel = chooseChannel()
         LinkLog.d(TAG) { "上报热点凭据 ssid=$ssid channel=$channel" }

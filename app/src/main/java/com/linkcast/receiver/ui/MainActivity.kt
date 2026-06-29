@@ -19,11 +19,11 @@ import android.widget.Button
 import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.TextView
-import com.linkcast.receiver.ProjectionService
+import com.linkcast.receiver.CarPlayService
 import com.linkcast.receiver.diag.LinkLog
 import com.linkcast.receiver.input.InputForwarder
 
-class MainActivity : Activity(), SurfaceHolder.Callback, ProjectionService.StatusListener {
+class MainActivity : Activity(), SurfaceHolder.Callback, CarPlayService.StatusListener {
     private val inputForwarder = InputForwarder()
     private lateinit var surfaceView: SurfaceView
     private lateinit var phaseView: TextView
@@ -65,12 +65,12 @@ class MainActivity : Activity(), SurfaceHolder.Callback, ProjectionService.Statu
         }
         connectButton = Button(this).apply {
             text = "开始连接"
-            setOnClickListener { ProjectionService.connect(this@MainActivity) }
+            setOnClickListener { CarPlayService.connect(this@MainActivity) }
         }
         cancelButton = Button(this).apply {
             text = "取消连接"
             isEnabled = false
-            setOnClickListener { ProjectionService.cancel(this@MainActivity) }
+            setOnClickListener { CarPlayService.cancel(this@MainActivity) }
         }
 
         val buttonRow = LinearLayout(this).apply {
@@ -103,22 +103,22 @@ class MainActivity : Activity(), SurfaceHolder.Callback, ProjectionService.Statu
         })
 
         // 启动前台服务(不自动连接),由用户在界面上发起连接。
-        ProjectionService.start(this)
+        CarPlayService.start(this)
     }
 
     override fun onResume() {
         super.onResume()
-        ProjectionService.statusListener = this
+        CarPlayService.statusListener = this
         // 立即刷新当前阶段(SurfaceView 的挂载由 surfaceChanged 处理,这里不动 surface)。
-        onPhase(ProjectionService.lastPhase, ProjectionService.isConnecting)
+        onPhase(CarPlayService.lastPhase, CarPlayService.isConnecting)
     }
 
     override fun onPause() {
-        if (ProjectionService.statusListener === this) ProjectionService.statusListener = null
+        if (CarPlayService.statusListener === this) CarPlayService.statusListener = null
         super.onPause()
     }
 
-    // ProjectionService.StatusListener —— 始终在主线程回调。
+    // CarPlayService.StatusListener —— 始终在主线程回调。
     override fun onPhase(phase: String, connecting: Boolean) {
         phaseView.text = "极连投屏 LinkCast — $phase"
         connectButton.isEnabled = !connecting
@@ -133,8 +133,8 @@ class MainActivity : Activity(), SurfaceHolder.Callback, ProjectionService.Statu
     }
 
     override fun onDestroy() {
-        if (ProjectionService.statusListener === this) ProjectionService.statusListener = null
-        ProjectionService.attachSurface(null, 0, 0)
+        if (CarPlayService.statusListener === this) CarPlayService.statusListener = null
+        CarPlayService.attachSurface(null, 0, 0)
         super.onDestroy()
     }
 
@@ -146,12 +146,12 @@ class MainActivity : Activity(), SurfaceHolder.Callback, ProjectionService.Statu
 
     override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {
         LinkLog.d(TAG) { "surfaceChanged ${width}x$height valid=${holder.surface?.isValid}" }
-        ProjectionService.attachSurface(holder.surface, width, height)
+        CarPlayService.attachSurface(holder.surface, width, height)
     }
 
     override fun surfaceDestroyed(holder: SurfaceHolder) {
         LinkLog.d(TAG) { "surfaceDestroyed" }
-        ProjectionService.attachSurface(null, 0, 0)
+        CarPlayService.attachSurface(null, 0, 0)
     }
 
     override fun dispatchKeyEvent(event: KeyEvent): Boolean {

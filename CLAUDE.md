@@ -33,7 +33,7 @@ adb install -r -g app/build/outputs/apk/debug/app-debug.apk
 ## 架构 / 模块
 
 胶水层 `com.linkcast.receiver`:
-- `ProjectionService` — 核心前台服务,串起认证/热点/mDNS/状态机/音视频/输入。UI 通过 `StatusListener` 收阶段与日志。
+- `CarPlayService` — 核心前台服务,串起认证/热点/mDNS/状态机/音视频/输入。UI 通过 `StatusListener` 收阶段与日志。
 - `ui/MainActivity` — SurfaceView(投屏画面)+ 连接/取消按钮 + 日志面板(投屏后自动隐藏)。
 - `transport/BtIap2Transport` — 蓝牙 RFCOMM(iAP2 UUID)连接 iPhone,喂 `income_data`,回写 `output_data`。
 - `auth/` — MFi 签名提供方:`NetworkMfiAuthProvider`(网络,主力)、`LocalMfiAuthProvider`(USB MFi 芯片,备用)、`AuthProvider`/Empty。
