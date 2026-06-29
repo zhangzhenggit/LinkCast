@@ -1,55 +1,64 @@
 package com.linkcast.receiver.media
 
+import android.graphics.SurfaceTexture
 import android.media.MediaCodec
 import android.media.MediaFormat
 import android.os.Handler
 import android.os.HandlerThread
-import android.util.Log
 import android.view.Surface
 import com.google.android.projection.common.BufferPool
+import com.linkcast.receiver.diag.LinkLog
 import java.nio.ByteBuffer
-import java.util.concurrent.atomic.AtomicBoolean
 
+/**
+ * HEVC/H.264 解码管线。
+ *
+ * 解码器始终有一个有效的输出 Surface:有屏上 Surface 时输出到它,没有(如 App 切后台、
+ * SurfaceView 销毁)时切到一个常驻占位 Surface。这样解码器全程不释放、持续消费帧流,
+ * 上层 native 不会因输出端消失而停流,回前台只需把输出切回屏上 Surface 即可瞬时恢复。
+ */
 class VideoPipeline {
-    companion object {
-        private const val TAG = "VideoPipeline"
-        private const val MIME_HEVC = "video/hevc"
-        private const val MIME_AVC = "video/avc"
-    }
-
-    // CarPlay on current iPhones streams H.265/HEVC; older/fallback is H.264. Default to
-    // HEVC and fall back to AVC if HEVC decoding can't be created.
-    @Volatile private var mime = MIME_HEVC
-
     private val thread = HandlerThread("linkcast-video").also { it.start() }
     private val handler = Handler(thread.looper)
-    private val configured = AtomicBoolean(false)
 
-    @Volatile private var surface: Surface? = null
+    @Volatile private var mime = MIME_HEVC
     @Volatile private var codec: MediaCodec? = null
     @Volatile private var width = 1280
     @Volatile private var height = 720
+    @Volatile private var frameCount = 0L
 
-    // 解码器(重新)就绪后回调,用于向发送端请求一个关键帧,否则新解码器无 IDR 不出画面。
+    // 屏上 Surface(来自 SurfaceView);为空表示当前无可见输出。
+    @Volatile private var realSurface: Surface? = null
+
+    // 常驻占位 Surface:无屏上 Surface 时解码器输出到这里,保持解码器存活、帧流不断。
+    private var dummyTexture: SurfaceTexture? = null
+    private var dummySurface: Surface? = null
+
+    // 解码器(重新)挂到屏上 Surface 后回调,用于请求一个关键帧,使新画面尽快刷新。
     @Volatile var onDecoderReady: (() -> Unit)? = null
 
     fun setSurface(surface: Surface?, width: Int, height: Int) {
         handler.post {
-            val previous = this.surface
-            this.surface = surface
-            // 解码器尺寸用视频流尺寸而非 SurfaceView 尺寸,MediaCodec 自动缩放到 surface。
-            when {
-                surface == null -> releaseDecoder()
-                // 重新获得 surface(如从主页返回):重建解码器并请求关键帧以恢复画面。
-                surface != previous -> {
-                    Log.d(TAG, "surface 重新挂载,重建解码器并请求关键帧")
-                    if (rebuildDecoder() != null) onDecoderReady?.invoke()
-                }
+            realSurface = surface
+            val target = outputSurface()
+            val current = codec
+            if (current == null) {
+                // 解码器尚未建立:建好后若已有屏上 Surface,请求关键帧刷新。
+                if (rebuildDecoder() != null && surface != null) onDecoderReady?.invoke()
+                return@post
             }
+            // 解码器已存在:热切换输出 Surface,不重建,保持帧流连续。
+            val swapped = runCatching { current.setOutputSurface(target) }.isSuccess
+            if (!swapped) {
+                LinkLog.w(TAG) { "切换输出 Surface 失败,改为重建解码器" }
+                if (rebuildDecoder() == null) return@post
+            }
+            // 切回屏上 Surface 时请求关键帧,清掉切换瞬间可能的花屏。
+            if (surface != null) onDecoderReady?.invoke()
         }
     }
 
-    /** Set the encoded video stream dimensions (from CarPlay negotiation, e.g. 1280x720). */
+    /** 设置编码视频流尺寸(来自 CarPlay 协商,如 1280x720)。 */
     fun setVideoSize(w: Int, h: Int) {
         handler.post {
             if (w in 1..7680 && h in 1..4320 && (w != width || h != height)) {
@@ -60,19 +69,16 @@ class VideoPipeline {
         }
     }
 
-    @Volatile private var frameCount = 0L
-
     fun queueFrame(flags: Int, buffer: ByteBuffer) {
         handler.post {
             try {
-                if (frameCount == 0L) {
-                    Log.d(TAG, "First video frame: ${buffer.remaining()}B flags=$flags surface=${surface != null}")
-                }
                 frameCount++
-                if (frameCount % 60 == 1L) Log.d(TAG, "视频帧 #$frameCount keyFrame=${(flags and 0x8000) != 0}")
+                if (frameCount % 60 == 1L) {
+                    LinkLog.d(TAG) { "视频帧 #$frameCount keyFrame=${(flags and 0x8000) != 0}" }
+                }
                 val decoder = codec ?: rebuildDecoder()
                 if (decoder == null) {
-                    if (frameCount % 60 == 1L) Log.w(TAG, "No decoder (surface=${surface != null}); dropping frame #$frameCount")
+                    LinkLog.w(TAG) { "无解码器,丢弃帧 #$frameCount" }
                     BufferPool.returnBuffer(buffer)
                     return@post
                 }
@@ -80,16 +86,15 @@ class VideoPipeline {
                 if (inputIndex >= 0) {
                     val input = decoder.getInputBuffer(inputIndex)
                     input?.clear()
-                    // The native delivers length-prefixed NAL units (4-byte big-endian
-                    // length per the stream's nalSizeHeader=4); MediaCodec wants Annex-B
-                    // start codes. Rewrite each 4-byte length to 00 00 00 01 (same size).
+                    // native 送来的是长度前缀(4 字节大端)的 NAL 单元,MediaCodec 需要 Annex-B
+                    // 起始码;把每段长度原位改写成 00 00 00 01(同为 4 字节,长度不变)。
                     val size = toAnnexB(buffer)
                     input?.put(buffer)
                     decoder.queueInputBuffer(inputIndex, 0, size, 0L, mediaCodecFlags(flags))
                 }
                 drainOutput(decoder)
             } catch (error: Exception) {
-                Log.w(TAG, "queueFrame failed; rebuilding decoder", error)
+                LinkLog.w(TAG) { "解码帧失败,重建解码器: $error" }
                 rebuildDecoder()
             } finally {
                 BufferPool.returnBuffer(buffer)
@@ -100,45 +105,50 @@ class VideoPipeline {
     fun release() {
         handler.post {
             releaseDecoder()
+            dummySurface?.release()
+            dummySurface = null
+            dummyTexture?.release()
+            dummyTexture = null
             thread.quitSafely()
         }
     }
 
+    // 当前应使用的输出 Surface:优先屏上 Surface,否则占位 Surface。
+    private fun outputSurface(): Surface = realSurface ?: ensureDummySurface()
+
+    private fun ensureDummySurface(): Surface {
+        dummySurface?.let { return it }
+        // 脱离 GL 上下文的 SurfaceTexture,仅作解码输出的丢弃式接收端(不消费即覆盖)。
+        val texture = SurfaceTexture(false).apply { setDefaultBufferSize(1, 1) }
+        val surface = Surface(texture)
+        dummyTexture = texture
+        dummySurface = surface
+        return surface
+    }
+
     private fun rebuildDecoder(): MediaCodec? {
         releaseDecoder()
-        val outputSurface = surface ?: return null
-        return try {
-            val format = MediaFormat.createVideoFormat(mime, width, height)
-            val decoder = MediaCodec.createDecoderByType(mime)
-            decoder.configure(format, outputSurface, null, 0)
-            decoder.start()
-            codec = decoder
-            configured.set(true)
-            Log.d(TAG, "Decoder started: $mime ${width}x${height}")
-            decoder
-        } catch (error: Exception) {
-            Log.w(TAG, "Unable to create $mime decoder", error)
-            // Fall back to the other common CarPlay codec and retry once.
+        val target = outputSurface()
+        return createDecoder(mime, target) ?: run {
+            // 当前编码格式建不出解码器时,切到另一种常见 CarPlay 编码再试一次。
             mime = if (mime == MIME_HEVC) MIME_AVC else MIME_HEVC
-            codec = null
-            configured.set(false)
-            runCatching {
-                val format = MediaFormat.createVideoFormat(mime, width, height)
-                val decoder = MediaCodec.createDecoderByType(mime)
-                decoder.configure(format, outputSurface, null, 0)
-                decoder.start()
-                codec = decoder
-                configured.set(true)
-                Log.d(TAG, "Decoder started (fallback): $mime ${width}x${height}")
-                decoder
-            }.getOrNull()
+            createDecoder(mime, target)
         }
     }
+
+    private fun createDecoder(mime: String, surface: Surface): MediaCodec? = runCatching {
+        val format = MediaFormat.createVideoFormat(mime, width, height)
+        val decoder = MediaCodec.createDecoderByType(mime)
+        decoder.configure(format, surface, null, 0)
+        decoder.start()
+        codec = decoder
+        LinkLog.d(TAG) { "解码器启动: $mime ${width}x${height}" }
+        decoder
+    }.onFailure { e -> LinkLog.w(TAG) { "创建 $mime 解码器失败: $e" } }.getOrNull()
 
     private fun releaseDecoder() {
         val old = codec
         codec = null
-        configured.set(false)
         runCatching { old?.stop() }
         runCatching { old?.release() }
     }
@@ -152,9 +162,8 @@ class VideoPipeline {
         }
     }
 
-    // Convert in place: each NAL unit is [4-byte big-endian length][payload]; replace the
-    // length with the Annex-B start code 00 00 00 01 (same 4 bytes, so length is preserved).
-    // Returns the total byte count; on any inconsistency leaves the buffer untouched.
+    // 原位转换:每个 NAL 单元是 [4 字节大端长度][数据],把长度改写成 Annex-B 起始码
+    // 00 00 00 01(同为 4 字节,长度保持不变)。返回总字节数;遇到不符合预期的结构则原样返回。
     private fun toAnnexB(buffer: ByteBuffer): Int {
         val total = buffer.remaining()
         val base = buffer.position()
@@ -166,7 +175,6 @@ class VideoPipeline {
                 ((buffer.get(off + 2).toInt() and 0xff) shl 8) or
                 (buffer.get(off + 3).toInt() and 0xff)
             if (len <= 0 || off + 4 + len > end) {
-                // Not length-prefixed as expected — feed as-is rather than corrupt it.
                 return total
             }
             buffer.put(off, 0)
@@ -181,5 +189,11 @@ class VideoPipeline {
     private fun mediaCodecFlags(nativeFlags: Int): Int {
         val keyFrame = (nativeFlags and 0x8000) != 0
         return if (keyFrame) MediaCodec.BUFFER_FLAG_KEY_FRAME else 0
+    }
+
+    companion object {
+        private const val TAG = "VideoPipeline"
+        private const val MIME_HEVC = "video/hevc"
+        private const val MIME_AVC = "video/avc"
     }
 }

@@ -112,10 +112,11 @@ class ProjectionService : Service(), NativeCallbacks, BtIap2Transport.Listener {
     override fun onCreate() {
         super.onCreate()
         instance = this
-        // 解码器重建后(如从主页返回重新挂载 surface),请求发送端补发关键帧以恢复画面。
+        // 切回屏上 Surface 后(如从主页返回),请求发送端补发关键帧以恢复画面。
+        // 参数取 1 才真正请求关键帧(原生侧:0/2 是 UI 外观更新,1 才是 ForceKeyFrame)。
         videoPipeline.onDecoderReady = {
-            log("解码器就绪,请求关键帧 forceKeyFrame(0)")
-            runCatching { CarplayNative.forceKeyFrame(0) }
+            log("Surface 就绪,请求关键帧 forceKeyFrame(1)")
+            runCatching { CarplayNative.forceKeyFrame(1) }
                 .onFailure { log("forceKeyFrame 失败: $it") }
         }
         config = LinkConfig(this)

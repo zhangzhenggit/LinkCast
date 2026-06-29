@@ -5,13 +5,10 @@ import android.app.Activity
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
-import android.graphics.SurfaceTexture
 import android.view.Gravity
 import android.view.KeyEvent
-import android.view.Surface
 import android.view.SurfaceHolder
 import android.view.SurfaceView
-import android.view.TextureView
 import android.view.View
 import android.view.ViewGroup
 import android.view.WindowManager
@@ -23,16 +20,12 @@ import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.TextView
 import com.linkcast.receiver.ProjectionService
+import com.linkcast.receiver.diag.LinkLog
 import com.linkcast.receiver.input.InputForwarder
 
-class MainActivity : Activity(),
-    TextureView.SurfaceTextureListener,
-    SurfaceHolder.Callback,
-    ProjectionService.StatusListener {
-
+class MainActivity : Activity(), SurfaceHolder.Callback, ProjectionService.StatusListener {
     private val inputForwarder = InputForwarder()
-    private lateinit var videoView: View
-    private var surface: Surface? = null
+    private lateinit var surfaceView: SurfaceView
     private lateinit var phaseView: TextView
     private lateinit var logView: TextView
     private lateinit var connectButton: Button
@@ -42,12 +35,8 @@ class MainActivity : Activity(),
 
     private val logLines = ArrayDeque<String>()
 
-    companion object {
-        // 渲染视图选择:
-        // true  = SurfaceView,硬件 overlay 零拷贝、最跟手,但切后台 surface 销毁,回主页再进会短暂黑屏;
-        // false = TextureView,走 GPU 合成多一次拷贝,高分辨率下更易卡顿,但切后台不销毁、回前台无缝。
-        // 当前用于对比验证卡顿是否由 TextureView 引入。
-        private const val RENDER_WITH_SURFACE_VIEW = false
+    private companion object {
+        const val TAG = "MainActivity"
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -55,7 +44,14 @@ class MainActivity : Activity(),
         enterFullscreen()
         requestRuntimePermissions()
 
-        videoView = createVideoView()
+        // 用 SurfaceView 渲染投屏:硬件 overlay 直出,性能/清晰度/流畅度最佳。切后台 surface 销毁
+        // 不丢解码器(VideoPipeline 切到占位 Surface 保活),回前台 surfaceChanged 重新挂回即可。
+        surfaceView = SurfaceView(this).apply {
+            holder.addCallback(this@MainActivity)
+            isFocusable = true
+            isFocusableInTouchMode = true
+            setOnTouchListener { view, event -> inputForwarder.onTouch(view, event) }
+        }
 
         phaseView = TextView(this).apply {
             text = "极连投屏 LinkCast — 空闲"
@@ -90,8 +86,7 @@ class MainActivity : Activity(),
             addView(buttonRow)
             addView(logView)
         }
-        // Small floating toggle to show/hide the panel — when projecting, the panel is
-        // hidden so it doesn't block touches; tap this to bring controls/logs back.
+        // 投屏时隐藏控制面板避免遮挡触控;点这个浮动按钮可重新唤出面板(含取消)。
         toggleButton = Button(this).apply {
             text = "≡"
             alpha = 0.5f
@@ -102,22 +97,19 @@ class MainActivity : Activity(),
 
         setContentView(FrameLayout(this).apply {
             setBackgroundColor(0xff111318.toInt())
-            addView(videoView, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
+            addView(surfaceView, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
             addView(panel, FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.TOP or Gravity.START))
             addView(toggleButton, FrameLayout.LayoutParams(120, 120, Gravity.TOP or Gravity.END))
         })
 
-        // Foreground service up (no auto-connect); the user drives connect from the UI.
+        // 启动前台服务(不自动连接),由用户在界面上发起连接。
         ProjectionService.start(this)
     }
 
     override fun onResume() {
         super.onResume()
         ProjectionService.statusListener = this
-        // TextureView 的 SurfaceTexture 切后台不销毁,回前台若已存在则重新挂载;
-        // SurfaceView 切后台会销毁 surface,由 surfaceCreated 重新挂载,这里 surface 为 null 不重复挂。
-        surface?.let { ProjectionService.attachSurface(it, videoView.width, videoView.height) }
-        // Render the latest known phase immediately on (re)bind.
+        // 立即刷新当前阶段(SurfaceView 的挂载由 surfaceChanged 处理,这里不动 surface)。
         onPhase(ProjectionService.lastPhase, ProjectionService.isConnecting)
     }
 
@@ -126,13 +118,11 @@ class MainActivity : Activity(),
         super.onPause()
     }
 
-    // ProjectionService.StatusListener — always delivered on the main thread.
+    // ProjectionService.StatusListener —— 始终在主线程回调。
     override fun onPhase(phase: String, connecting: Boolean) {
         phaseView.text = "极连投屏 LinkCast — $phase"
         connectButton.isEnabled = !connecting
         cancelButton.isEnabled = connecting
-        // Once projecting, auto-hide the panel so it doesn't block CarPlay touches; the
-        // floating ≡ button stays to bring it back (and cancel). Show it again otherwise.
         panel.visibility = if (phase.contains("投屏")) View.GONE else View.VISIBLE
     }
 
@@ -145,50 +135,24 @@ class MainActivity : Activity(),
     override fun onDestroy() {
         if (ProjectionService.statusListener === this) ProjectionService.statusListener = null
         ProjectionService.attachSurface(null, 0, 0)
-        surface?.release()
-        surface = null
         super.onDestroy()
     }
 
-    // 按开关创建渲染视图,两种实现的触控/焦点配置一致。
-    private fun createVideoView(): View {
-        val view: View = if (RENDER_WITH_SURFACE_VIEW) {
-            SurfaceView(this).also { it.holder.addCallback(this) }
-        } else {
-            TextureView(this).also { it.surfaceTextureListener = this }
-        }
-        view.isFocusable = true
-        view.isFocusableInTouchMode = true
-        view.setOnTouchListener { v, event -> inputForwarder.onTouch(v, event) }
-        return view
+    // SurfaceHolder.Callback:surface 由系统创建/销毁。销毁时交出 null,VideoPipeline 切到占位
+    // Surface 保活;尺寸就绪(surfaceChanged)时挂回真实 surface。
+    override fun surfaceCreated(holder: SurfaceHolder) {
+        LinkLog.d(TAG) { "surfaceCreated" }
     }
 
-    // SurfaceView 回调。surface 由系统创建/销毁,切后台销毁后回前台重建(回主页再进会短暂黑屏)。
-    override fun surfaceCreated(holder: SurfaceHolder) {}
-
     override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {
-        surface = holder.surface
-        ProjectionService.attachSurface(surface, width, height)
+        LinkLog.d(TAG) { "surfaceChanged ${width}x$height valid=${holder.surface?.isValid}" }
+        ProjectionService.attachSurface(holder.surface, width, height)
     }
 
     override fun surfaceDestroyed(holder: SurfaceHolder) {
-        surface = null
+        LinkLog.d(TAG) { "surfaceDestroyed" }
         ProjectionService.attachSurface(null, 0, 0)
     }
-
-    override fun onSurfaceTextureAvailable(texture: SurfaceTexture, width: Int, height: Int) {
-        surface = Surface(texture)
-        ProjectionService.attachSurface(surface, width, height)
-    }
-
-    override fun onSurfaceTextureSizeChanged(texture: SurfaceTexture, width: Int, height: Int) {
-        ProjectionService.attachSurface(surface, width, height)
-    }
-
-    // 返回 false:切后台时保留 SurfaceTexture,使投屏画面流不中断,回前台无需重建。
-    override fun onSurfaceTextureDestroyed(texture: SurfaceTexture): Boolean = false
-
-    override fun onSurfaceTextureUpdated(texture: SurfaceTexture) {}
 
     override fun dispatchKeyEvent(event: KeyEvent): Boolean {
         return inputForwarder.onKey(event) || super.dispatchKeyEvent(event)
