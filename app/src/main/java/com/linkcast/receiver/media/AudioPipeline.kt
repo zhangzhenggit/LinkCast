@@ -40,6 +40,11 @@ class AudioPipeline {
         if (dir and 0x1 != 0 && ptr != 0L) {
             outputStreams[nativePtr] = AudioOutput(AudioSpec(samplingRate, channels), ptr).also { it.start() }
         }
+        // dir bit1 = input (录音):Siri/电话时 iPhone 请求这一路麦克风流。采集本机(平板/车机)麦克风
+        // PCM 经 sendAudioData(ptr) 回送给 iPhone。对齐原版(CarplayNative: v9 & 0x2 → e3.a 录音器)。
+        if (dir and 0x2 != 0 && ptr != 0L) {
+            inputStreams[nativePtr] = AudioInput(AudioSpec(samplingRate, channels), ptr).also { it.start() }
+        }
     }
 
     fun destroy(key: String) {
@@ -122,9 +127,8 @@ private class AudioOutput(private val spec: AudioSpec, private val nativePointer
     companion object { private const val HEADER = 12 }
 }
 
-private class AudioInput(private val spec: AudioSpec, key: String) {
+private class AudioInput(private val spec: AudioSpec, private val nativePointer: Long) {
     private val running = AtomicBoolean(false)
-    private val nativePointer = key.removePrefix("0x").toLongOrNull(16) ?: 0L
     private var thread: Thread? = null
 
     fun start() {
@@ -144,7 +148,7 @@ private class AudioInput(private val spec: AudioSpec, key: String) {
         val frameBytes = (spec.sampleRate * 2 * spec.channels) / 50
         val minSize = AudioRecord.getMinBufferSize(spec.sampleRate, spec.inputChannelMask, AudioFormat.ENCODING_PCM_16BIT)
         val recorder = AudioRecord(
-            MediaRecorder.AudioSource.MIC,
+            AUDIO_SOURCE,
             spec.sampleRate,
             spec.inputChannelMask,
             AudioFormat.ENCODING_PCM_16BIT,
@@ -170,5 +174,11 @@ private class AudioInput(private val spec: AudioSpec, key: String) {
             runCatching { recorder.stop() }
             recorder.release()
         }
+    }
+
+    companion object {
+        // 麦克风采集源。MIC=原版做法(裸麦,无处理);若平板外放导致 Siri/通话回声,
+        // 改为 MediaRecorder.AudioSource.VOICE_COMMUNICATION 启用系统回声消除/降噪。
+        private const val AUDIO_SOURCE = MediaRecorder.AudioSource.MIC
     }
 }
