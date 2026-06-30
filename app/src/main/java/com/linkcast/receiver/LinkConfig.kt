@@ -38,6 +38,11 @@ class LinkConfig(context: Context) {
     val diagLogEnabled: Boolean get() = prefs.getInt("diag_log", 1) > 0
     val hotspotChannel: Int get() = prefs.getInt("etx_wifi_channel", 0)
     val autoConnect: Boolean get() = prefs.getInt("key_auto_connect", 1) > 0
+
+    // 自动连接总开关(循环连接)。默认关,便于测试时手动开启。可读写、持久化。
+    var autoConnectEnabled: Boolean
+        get() = prefs.getInt("key_auto_connect_loop", 0) > 0
+        set(value) = prefs.edit { putInt("key_auto_connect_loop", if (value) 1 else 0) }
     val defaultBluetoothAddress: String get() = prefs.getString("key_default_btdevice", "").orEmpty()
     val networkMfiEnabled: Boolean get() = prefs.getInt("networkmfi", 1) > 0
 

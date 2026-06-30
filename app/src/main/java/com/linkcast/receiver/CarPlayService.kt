@@ -1,12 +1,17 @@
 package com.linkcast.receiver
 
+import android.Manifest
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
+import android.bluetooth.BluetoothManager
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
+import android.net.ConnectivityManager
+import android.net.NetworkCapabilities
 import android.os.Build
 import android.os.Handler
 import android.os.HandlerThread
@@ -15,10 +20,13 @@ import android.os.Looper
 import android.util.Log
 import android.view.Surface
 import android.widget.Toast
+import androidx.core.content.ContextCompat
 import com.example.autoservice.carplay.CarplayNative
+import com.linkcast.receiver.diag.FileLogSink
 import com.linkcast.receiver.diag.LinkLog
 import com.linkcast.receiver.auth.LocalMfiAuthProvider
 import com.linkcast.receiver.auth.NetworkMfiAuthProvider
+import com.linkcast.receiver.auth.NetworkMfiRejected
 import com.linkcast.receiver.media.AudioPipeline
 import com.linkcast.receiver.media.CodecSupport
 import com.linkcast.receiver.media.VideoPipeline
@@ -34,9 +42,12 @@ import com.linkcast.receiver.ui.MainActivity
 import java.nio.ByteBuffer
 
 class CarPlayService : Service(), NativeCallbacks, BtIap2Transport.Listener {
-    /** UI status bus. The Activity registers to render the phase + a log tail. */
+    /** UI status bus. The Activity registers to render status + a detail line + a log tail. */
     interface StatusListener {
-        fun onPhase(phase: String, connecting: Boolean)
+        // 主状态(headline):UI 据此显示文案/颜色与按钮态。
+        fun onStatus(status: ConnectionStatus)
+        // 细节子行:native 进度文案(如"等待 iPhone 加入热点…")。
+        fun onPhase(detail: String)
         fun onLog(line: String)
     }
 
@@ -44,10 +55,10 @@ class CarPlayService : Service(), NativeCallbacks, BtIap2Transport.Listener {
         private const val TAG = "CarPlayService"
         private const val CHANNEL_ID = "linkcast_projection"
         private const val NOTIFICATION_ID = 1
-        private const val CONNECTING_TIMEOUT_MS = 120_000L
-        private const val AUTO_CONNECT_DELAY_MS = 500L
         private const val ACTION_CONNECT = "com.linkcast.receiver.action.CONNECT"
         private const val ACTION_DISCONNECT = "com.linkcast.receiver.action.DISCONNECT"
+        private const val ACTION_AUTO = "com.linkcast.receiver.action.AUTO"
+        private const val EXTRA_AUTO = "auto_enabled"
         // Bundled archive (classes.dex + resources.arsc paired with the native libs)
         // used for the native integrity check; staged from assets to filesDir.
         private const val VERIFICATION_RES_FILE = "receiver_res.zip"
@@ -56,14 +67,12 @@ class CarPlayService : Service(), NativeCallbacks, BtIap2Transport.Listener {
 
         @Volatile var statusListener: StatusListener? = null
 
-        /** Latest phase text so a freshly-bound Activity can render immediately. */
-        @Volatile var lastPhase: String = "空闲"
-            private set
-        @Volatile var isConnecting: Boolean = false
+        /** 最近的 native 进度细节文案,供新绑定的 Activity 立即渲染。 */
+        @Volatile var lastPhase: String = ""
             private set
 
-        /** 连接级状态(含重连),供界面展示。 */
-        @Volatile var connectionStatus: ConnectionController.Status = ConnectionController.Status.Idle
+        /** 对外连接状态(headline),供界面展示与快照渲染。 */
+        @Volatile var connectionStatus: ConnectionStatus = ConnectionStatus.Off
             private set
 
         fun cancel(context: Context) = disconnect(context)
@@ -80,6 +89,14 @@ class CarPlayService : Service(), NativeCallbacks, BtIap2Transport.Listener {
 
         fun disconnect(context: Context) {
             context.startService(Intent(context, CarPlayService::class.java).setAction(ACTION_DISCONNECT))
+        }
+
+        /** 自动连接总开关。开启时会拉起服务并进入循环连接。 */
+        fun setAutoConnect(context: Context, enabled: Boolean) {
+            val intent = Intent(context, CarPlayService::class.java)
+                .setAction(ACTION_AUTO)
+                .putExtra(EXTRA_AUTO, enabled)
+            if (Build.VERSION.SDK_INT >= 26) context.startForegroundService(intent) else context.startService(intent)
         }
 
         fun stop(context: Context) {
@@ -115,9 +132,16 @@ class CarPlayService : Service(), NativeCallbacks, BtIap2Transport.Listener {
     private lateinit var worker: Handler
     private val mainHandler = Handler(Looper.getMainLooper())
 
+    // 签名在独立线程跑(可能排队等待签名服务器),避免阻塞 worker 上的状态机。
+    private lateinit var signingExecutor: java.util.concurrent.ExecutorService
+    // 代次令牌:每次启动/停止递增,使在途签名完成后能判断本次尝试是否已被取消/重起。仅 worker 访问。
+    private var signGeneration = 0
+    private var currentCanceller: NetworkMfiAuthProvider.Canceller? = null
+
     private val videoPipeline = VideoPipeline()
     private val audioPipeline = AudioPipeline()
     private var authProvider: AuthProvider = EmptyAuthProvider
+    private var fileLogSink: FileLogSink? = null
 
     override fun onCreate() {
         super.onCreate()
@@ -133,8 +157,13 @@ class CarPlayService : Service(), NativeCallbacks, BtIap2Transport.Listener {
         videoPipeline.onDecoderFatal = { wasHevc -> worker.post { handleDecoderFatal(wasHevc) } }
         config = LinkConfig(this)
         LinkLog.enabled = config.diagLogEnabled
+        // 文件日志:本机 ROM 屏蔽 logcat,落地到私有目录便于取证(后续接 App 内日志页)。
+        fileLogSink = FileLogSink(java.io.File(filesDir, "linkcast-log.txt")).also { LinkLog.addSink(it) }
         workerThread = HandlerThread("linkcast-service").also { it.start() }
         worker = Handler(workerThread.looper)
+        signingExecutor = java.util.concurrent.Executors.newSingleThreadExecutor { r ->
+            Thread(r, "linkcast-signing")
+        }
         hotspotProvider = HotspotProvider(this, config, { showHotspotWarning(it) }) {
             getString(R.string.app_name)
         }
@@ -144,13 +173,17 @@ class CarPlayService : Service(), NativeCallbacks, BtIap2Transport.Listener {
         transport = newTransport()
         // 失败由 ConnectionController 经 native 状态统一决策,状态机的失败回调不再单独拆会话。
         stateMachine = ProjectionStateMachine(::onProjectionStateChanged) {}
-        controller = ConnectionController(worker, ::startSession, ::stopSession, ::onConnectionStatusChanged)
-        // 事件源:网络恢复 / 蓝牙连断 → 驱动控制器(均切到 worker 线程,与会话操作同线程)。
+        // 前置条件(权限/蓝牙/网络)以 lambda 注入,使控制器与 Android 细节解耦。
+        controller = ConnectionController(
+            worker, ::startSession, ::stopSession, ::onConnectionStatusChanged,
+            ::hasBluetoothConnectPermission, ::bluetoothReady, ::networkReady,
+        )
+        // 事件源:网络恢复 / 蓝牙开关 → 驱动控制器(均切到 worker 线程,与会话操作同线程)。
         networkMonitor = NetworkMonitor(this) { worker.post { controller.onNetworkAvailable() } }
         bluetoothMonitor = BluetoothPresenceMonitor(
             this,
-            { worker.post { controller.onBluetoothConnected() } },
-            { worker.post { controller.onBluetoothDisconnected() } },
+            { worker.post { controller.onBluetoothAvailable() } },
+            { worker.post { controller.onBluetoothUnavailable() } },
         )
         networkMonitor.start()
         bluetoothMonitor.start()
@@ -159,22 +192,48 @@ class CarPlayService : Service(), NativeCallbacks, BtIap2Transport.Listener {
         prepareNativePaths()
         // Apply any surface that the Activity created before this service existed.
         pendingSurface?.let { videoPipeline.setSurface(it, pendingW, pendingH) }
-        // Manual connect only: the user starts a connection from the UI. (Auto-connect
-        // on launch removed for easier test control.) The SoftAP is also NOT started
-        // here — it would drop the Wi-Fi client / internet the network MFi signer needs.
-        publishPhase("空闲", false)
+        // 按持久化的总开关决定是否进入循环连接(关=空闲,开=开始循环)。
+        // (开机自启/网络触发等启动时机后续单独处理。)
+        worker.post { controller.setAutoEnabled(config.autoConnectEnabled) }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
-            ACTION_CONNECT -> worker.post { controller.onUserConnect() }
-            ACTION_DISCONNECT -> worker.post { controller.onUserCancel() }
+            ACTION_CONNECT -> worker.post { controller.onManualConnect() }
+            ACTION_DISCONNECT -> worker.post { controller.onUserDisconnect() }
+            ACTION_AUTO -> {
+                val enabled = intent.getBooleanExtra(EXTRA_AUTO, false)
+                config.autoConnectEnabled = enabled
+                worker.post { controller.setAutoEnabled(enabled) }
+            }
         }
         return START_STICKY
     }
 
     private fun newTransport() =
         BtIap2Transport(this, { config.defaultBluetoothAddress }, this)
+
+    // —— 控制器前置条件(供 ConnectionController 预检)——
+
+    private fun hasBluetoothConnectPermission(): Boolean =
+        Build.VERSION.SDK_INT < 31 ||
+            ContextCompat.checkSelfPermission(this, Manifest.permission.BLUETOOTH_CONNECT) == PackageManager.PERMISSION_GRANTED
+
+    // 蓝牙是否整体可用:适配器开 且 有已配对设备(可主动发起 RFCOMM 的前提)。
+    private fun bluetoothReady(): Boolean {
+        val adapter = getSystemService(BluetoothManager::class.java)?.adapter ?: return false
+        if (!adapter.isEnabled) return false
+        return runCatching { adapter.bondedDevices?.isNotEmpty() == true }.getOrDefault(false)
+    }
+
+    // 是否具备签名所需网络:用本地签名(USB)时不需要;否则要有可上网的活动网络。
+    private fun networkReady(): Boolean {
+        if (!config.networkMfiEnabled) return true
+        val cm = getSystemService(ConnectivityManager::class.java) ?: return true
+        val network = cm.activeNetwork ?: return false
+        val caps = cm.getNetworkCapabilities(network) ?: return false
+        return caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+    }
 
     override fun onDestroy() {
         NativeCallbackRegistry.detach(this)
@@ -204,10 +263,10 @@ class CarPlayService : Service(), NativeCallbacks, BtIap2Transport.Listener {
     }
 
     // 把 native 上报的真实状态喂给控制器(状态机 reset 产生的 Idle 不走这里,避免误判为掉线)。
-    // 已成功签名却认证失败 = 服务端拒绝(到期/未授权),作终态;否则(没网签不了)按可重试失败处理。
+    // 终态"认证被拒"由签名阶段的服务器 0x62 权威给出;native 侧 AuthFailed 一律当可重试的瞬时失败,
+    // 避免断网/RFCOMM 闪断导致的重认证失败被误锁成终态。
     private fun feedController(state: ProjectionState) {
-        if (state == ProjectionState.AuthFailed && authProvider.canSign) controller.onAuthRejected()
-        else controller.onProjectionState(state)
+        controller.onProjectionState(state)
     }
 
     override fun onVideoData(flags: Int, buffer: ByteBuffer) {
@@ -241,30 +300,29 @@ class CarPlayService : Service(), NativeCallbacks, BtIap2Transport.Listener {
 
     override fun onTransportLog(message: String) = log(message)
 
+    override fun onRfcommConnected() {
+        // RFCOMM 连上即视为进入连接阶段(起看门狗),覆盖"已连上但 native 不上报"的卡死。
+        worker.post { controller.onLinkEngaged() }
+    }
+
     override fun onTransportDisconnected() {
         worker.post {
             stateMachine.reset()
+            // 链路断开(含投屏中手机走远)→ 作为可重试失败喂给控制器:状态回到"等待连接",
+            // transport 自身继续重试 RFCOMM,走近即自动重连。会话已被拆除时(sessionActive=false)控制器会忽略。
+            controller.onProjectionState(ProjectionState.ConnectFailed)
         }
     }
 
-    @Volatile private var networkProviderTried = false
-
-    private fun ensureAuthProvider() {
-        // USB chip (local signer) is chosen in onCreate. When none is present, fall
-        // back to the network MFi service (must run off the main thread — we're on the
-        // service worker here). Done before start() so the cert it returns is ready.
-        if (authProvider.canSign) return
-        if (networkProviderTried || !config.networkMfiEnabled) return
-        networkProviderTried = true
-        val net = runCatching { NetworkMfiAuthProvider.open(this, config) { log(it) } }
-            .onFailure { log("Network MFI open failed: $it") }
-            .getOrNull() ?: return
-        authProvider.release()
-        authProvider = net
-        log("Network MFI provider ready; cert=${net.certificate.size}")
+    // 签名结果(在 signingExecutor 线程算出,回到 worker 落定)。
+    private sealed interface SignOutcome {
+        object Proceed : SignOutcome                               // 无需网络签名 / 暂不可用 → 继续(native 自签)
+        object Rejected : SignOutcome                              // 服务端终态裁决(0x62)→ 暂停"认证被拒"
+        data class Ready(val provider: NetworkMfiAuthProvider) : SignOutcome
     }
 
     // 发起一次连接尝试(由 ConnectionController 调度,调用前会话已停)。
+    // 签名可能要等签名服务器排队,放到独立线程跑;期间 worker 上的状态机保持响应。
     private fun startSession() {
         // 上一次尝试会关闭 transport 的 executor,这里换一个新的,保证重连能跑完整流程。
         transport = newTransport()
@@ -275,11 +333,55 @@ class CarPlayService : Service(), NativeCallbacks, BtIap2Transport.Listener {
             runCatching { authProvider.release() }
             authProvider = EmptyAuthProvider
         }
-        // 每次尝试都重置网络签名标记,使其重新签名;否则上次因断网失败后会永久跳过签名,
-        // 网络恢复也连不上(USB 本地签名 canSign=true,ensureAuthProvider 会自动保留,不受影响)。
-        networkProviderTried = false
-        publishPhase("连接中(认证)…", true)
-        ensureAuthProvider()
+        publishDetail("连接中(认证)…")
+        // 取消上一次可能仍在途的签名,开新一代;到时凭代次判断本次尝试是否已被取消/重起。
+        currentCanceller?.cancel()
+        val gen = ++signGeneration
+        val canceller = NetworkMfiAuthProvider.Canceller()
+        currentCanceller = canceller
+        signingExecutor.execute {
+            val outcome = computeSigning(canceller)
+            worker.post { applySigningOutcome(gen, outcome) }
+        }
+    }
+
+    // 在 signingExecutor 线程阻塞计算签名结果(可能等待签名服务器排队)。
+    private fun computeSigning(canceller: NetworkMfiAuthProvider.Canceller): SignOutcome {
+        if (authProvider.canSign) return SignOutcome.Proceed       // 已有本地签名器(USB),无需网络
+        if (!config.networkMfiEnabled) return SignOutcome.Proceed
+        val result = runCatching { NetworkMfiAuthProvider.open(this, config, canceller) { log(it) } }
+        val error = result.exceptionOrNull()
+        if (error is NetworkMfiRejected) {
+            log("Network MFI 认证被拒: ${error.message}")
+            return SignOutcome.Rejected
+        }
+        if (error != null) {
+            log("Network MFI open failed: $error")
+            return SignOutcome.Proceed   // 暂时不可用(连不上/排队超时/被取消):离线时 native 可自签,继续。
+        }
+        return result.getOrNull()?.let { SignOutcome.Ready(it) } ?: SignOutcome.Proceed
+    }
+
+    // 回到 worker 落定签名结果:代次过期(已取消/已重起)则丢弃;被拒则暂停;否则续起会话。
+    private fun applySigningOutcome(gen: Int, outcome: SignOutcome) {
+        if (gen != signGeneration) {
+            (outcome as? SignOutcome.Ready)?.provider?.let { runCatching { it.release() } }
+            return
+        }
+        when (outcome) {
+            is SignOutcome.Ready -> {
+                authProvider.release()
+                authProvider = outcome.provider
+                log("Network MFI provider ready; cert=${outcome.provider.certificate.size}")
+                continueStartSession()
+            }
+            SignOutcome.Rejected -> controller.onAuthRejected()
+            SignOutcome.Proceed -> continueStartSession()
+        }
+    }
+
+    // 签名就绪后续起会话:起热点、原生引擎、RFCOMM。均在既有 worker/main 线程上,保持原顺序。
+    private fun continueStartSession() {
         // 在手机请求 Wi-Fi 配置之前先把热点起好并发布真实凭据,否则手机会拿到占位凭据连接失败。
         hotspotProvider.ensureStarted()
         // 原生引擎(setWifiConfiguration + setResolutions + start)在主 looper 线程初始化并阻塞至完成,
@@ -356,13 +458,8 @@ class CarPlayService : Service(), NativeCallbacks, BtIap2Transport.Listener {
     }
 
     private fun onProjectionStateChanged(state: ProjectionState) {
-        // Surface every stage to the UI. Still "connecting" until video starts or it fails.
-        val connecting = when (state) {
-            ProjectionState.VideoStream, ProjectionState.ConnectFailed,
-            ProjectionState.AuthFailed, ProjectionState.Idle -> false
-            else -> true
-        }
-        publishPhase(phaseTextFor(state), connecting)
+        // 把每个 native 阶段作为细节子行展示;主状态由 ConnectionController 统一给出。
+        publishDetail(phaseTextFor(state))
         when (state) {
             ProjectionState.AuthSucceeded -> {
                 hotspotProvider.ensureStarted()
@@ -374,7 +471,6 @@ class CarPlayService : Service(), NativeCallbacks, BtIap2Transport.Listener {
                 // it and hand its endpoint to the native to open the video session.
                 mdnsDiscovery.start()
             }
-            ProjectionState.Connecting -> worker.postDelayed({ handleConnectingTimeout() }, CONNECTING_TIMEOUT_MS)
             ProjectionState.Connected, ProjectionState.VideoStream -> {
                 // The native plays the AirPlay audio itself via AAudio; on automotive ROMs
                 // that output is only routed to the speaker once the app holds media audio
@@ -415,6 +511,10 @@ class CarPlayService : Service(), NativeCallbacks, BtIap2Transport.Listener {
     // 停止当前会话(含原生引擎),由 ConnectionController 调度。停 native 让下次 startSession
     // 按当前决策重新协商并重建热点/视频会话。stateMachine.reset 不喂控制器,避免误判掉线。
     private fun stopSession() {
+        // 取消在途签名并作废其续起:close 让阻塞的 open() 立即退出,代次递增使其回调被丢弃。
+        currentCanceller?.cancel()
+        currentCanceller = null
+        signGeneration++
         transport.stop()
         mdnsDiscovery.stop()
         airPlayAdvertiser.stop()
@@ -423,18 +523,16 @@ class CarPlayService : Service(), NativeCallbacks, BtIap2Transport.Listener {
         stateMachine.reset()
         runCatching { CarplayNative.stop() }
         CarplayNative.markNativeStopped()
+        // 清掉屏上定格的最后一帧(解码器随会话停掉,否则画面会一直留着)。
+        videoPipeline.clear()
         transport = newTransport()
-    }
-
-    private fun handleConnectingTimeout() {
-        if (controller.status == ConnectionController.Status.Connecting) {
-            log("连接超时($CONNECTING_TIMEOUT_MS ms),按失败处理")
-            controller.onProjectionState(ProjectionState.ConnectFailed)
-        }
     }
 
     private fun cleanupForStop() {
         controller.onStopped()
+        currentCanceller?.cancel()
+        currentCanceller = null
+        runCatching { signingExecutor.shutdownNow() }
         runCatching { networkMonitor.stop() }
         runCatching { bluetoothMonitor.stop() }
         transport.stop()
@@ -450,6 +548,7 @@ class CarPlayService : Service(), NativeCallbacks, BtIap2Transport.Listener {
         workerThread.quitSafely()
         runCatching { CarplayNative.stop() }
         CarplayNative.markNativeStopped()
+        fileLogSink?.let { LinkLog.removeSink(it) }
         stopForeground(STOP_FOREGROUND_REMOVE)
     }
 
@@ -487,7 +586,8 @@ class CarPlayService : Service(), NativeCallbacks, BtIap2Transport.Listener {
     }
 
     private fun log(message: String) {
-        Log.d(TAG, message)
+        // 经 LinkLog 走(logcat + 文件 sink),被 ROM 屏蔽 logcat 时仍可从文件取证。
+        LinkLog.i(TAG) { message }
         val l = statusListener ?: return
         mainHandler.post { runCatching { l.onLog(message) } }
     }
@@ -506,21 +606,23 @@ class CarPlayService : Service(), NativeCallbacks, BtIap2Transport.Listener {
         if (!wasHevc || config.effectiveCodecType() != LinkConfig.CODEC_HEVC) return
         config.markHevcFailed()
         toast("HEVC 解码失败,已切换 H.264")
-        controller.onProjectionState(ProjectionState.ConnectFailed)
+        // 重建会话:下次协商即用 H.264(仅相关标记已持久化,restart 会按新决策重起原生引擎)。
+        controller.restartSession()
     }
 
     // 连接状态变化(来自 ConnectionController):记录并暴露给界面。
-    private fun onConnectionStatusChanged(status: ConnectionController.Status) {
+    private fun onConnectionStatusChanged(status: ConnectionStatus) {
         connectionStatus = status
-        log("连接状态: $status")
-        if (status == ConnectionController.Status.Reconnecting) publishPhase("连接断开,正在重连…", true)
+        log("连接状态: ${status.label}")
+        val l = statusListener ?: return
+        mainHandler.post { runCatching { l.onStatus(status) } }
     }
 
-    private fun publishPhase(phase: String, connecting: Boolean) {
-        lastPhase = phase
-        isConnecting = connecting
+    // native 进度细节子行(主状态由 onConnectionStatusChanged 给出)。
+    private fun publishDetail(detail: String) {
+        lastPhase = detail
         val l = statusListener ?: return
-        mainHandler.post { runCatching { l.onPhase(phase, connecting) } }
+        mainHandler.post { runCatching { l.onPhase(detail) } }
     }
 
     private fun phaseTextFor(state: ProjectionState): String = when (state) {

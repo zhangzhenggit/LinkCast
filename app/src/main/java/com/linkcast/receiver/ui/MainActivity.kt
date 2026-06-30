@@ -20,20 +20,25 @@ import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.TextView
 import com.linkcast.receiver.CarPlayService
+import com.linkcast.receiver.ConnectionStatus
+import com.linkcast.receiver.LinkConfig
 import com.linkcast.receiver.diag.LinkLog
 import com.linkcast.receiver.input.InputForwarder
 
 class MainActivity : Activity(), SurfaceHolder.Callback, CarPlayService.StatusListener {
     private val inputForwarder = InputForwarder()
     private lateinit var surfaceView: SurfaceView
+    private lateinit var statusView: TextView
     private lateinit var phaseView: TextView
     private lateinit var logView: TextView
     private lateinit var connectButton: Button
     private lateinit var cancelButton: Button
+    private lateinit var autoSwitch: Button
     private lateinit var panel: LinearLayout
     private lateinit var toggleButton: Button
 
     private val logLines = ArrayDeque<String>()
+    private var autoEnabled = false
 
     private companion object {
         const val TAG = "MainActivity"
@@ -53,10 +58,14 @@ class MainActivity : Activity(), SurfaceHolder.Callback, CarPlayService.StatusLi
             setOnTouchListener { view, event -> inputForwarder.onTouch(view, event) }
         }
 
-        phaseView = TextView(this).apply {
-            text = "极连投屏 LinkCast — 空闲"
+        statusView = TextView(this).apply {
+            text = "极连投屏 LinkCast — 自动连接已关闭"
             setTextColor(0xffffffff.toInt())
             textSize = 16f
+        }
+        phaseView = TextView(this).apply {
+            setTextColor(0xffb8c0cc.toInt())
+            textSize = 12f
         }
         logView = TextView(this).apply {
             setTextColor(0xffb8c0cc.toInt())
@@ -64,24 +73,29 @@ class MainActivity : Activity(), SurfaceHolder.Callback, CarPlayService.StatusLi
             setPadding(0, 12, 0, 0)
         }
         connectButton = Button(this).apply {
-            text = "开始连接"
+            text = "立即连接"
             setOnClickListener { CarPlayService.connect(this@MainActivity) }
         }
         cancelButton = Button(this).apply {
-            text = "取消连接"
-            isEnabled = false
+            text = "断开"
             setOnClickListener { CarPlayService.cancel(this@MainActivity) }
+        }
+        // 测试用:自动连接总开关。开=进入循环连接,关=彻底停且任何事件都不恢复。
+        autoSwitch = Button(this).apply {
+            setOnClickListener { setAutoConnect(!autoEnabled) }
         }
 
         val buttonRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             addView(connectButton)
             addView(cancelButton)
+            addView(autoSwitch)
         }
         panel = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setBackgroundColor(0x99000000.toInt())
             setPadding(24, 18, 24, 18)
+            addView(statusView)
             addView(phaseView)
             addView(buttonRow)
             addView(logView)
@@ -102,15 +116,31 @@ class MainActivity : Activity(), SurfaceHolder.Callback, CarPlayService.StatusLi
             addView(toggleButton, FrameLayout.LayoutParams(120, 120, Gravity.TOP or Gravity.END))
         })
 
-        // 启动前台服务(不自动连接),由用户在界面上发起连接。
+        // 读取持久化的总开关状态,刷新按钮文案。
+        autoEnabled = LinkConfig(this).autoConnectEnabled
+        updateAutoSwitch()
+
+        // 启动前台服务。是否自动循环连接由总开关(持久化)决定。
         CarPlayService.start(this)
+    }
+
+    // 切换自动连接总开关:更新本地状态、通知服务、刷新按钮。
+    private fun setAutoConnect(enabled: Boolean) {
+        autoEnabled = enabled
+        CarPlayService.setAutoConnect(this, enabled)
+        updateAutoSwitch()
+    }
+
+    private fun updateAutoSwitch() {
+        autoSwitch.text = if (autoEnabled) "自动连接:开" else "自动连接:关"
     }
 
     override fun onResume() {
         super.onResume()
         CarPlayService.statusListener = this
-        // 立即刷新当前阶段(SurfaceView 的挂载由 surfaceChanged 处理,这里不动 surface)。
-        onPhase(CarPlayService.lastPhase, CarPlayService.isConnecting)
+        // 立即用快照刷新当前状态(SurfaceView 的挂载由 surfaceChanged 处理,这里不动 surface)。
+        onStatus(CarPlayService.connectionStatus)
+        CarPlayService.lastPhase.takeIf { it.isNotEmpty() }?.let { onPhase(it) }
     }
 
     override fun onPause() {
@@ -119,11 +149,31 @@ class MainActivity : Activity(), SurfaceHolder.Callback, CarPlayService.StatusLi
     }
 
     // CarPlayService.StatusListener —— 始终在主线程回调。
-    override fun onPhase(phase: String, connecting: Boolean) {
-        phaseView.text = "极连投屏 LinkCast — $phase"
-        connectButton.isEnabled = !connecting
-        cancelButton.isEnabled = connecting
-        panel.visibility = if (phase.contains("投屏")) View.GONE else View.VISIBLE
+
+    // 主状态(headline):文案 + 按 phase 上色 + 按钮态。
+    override fun onStatus(status: ConnectionStatus) {
+        statusView.text = "极连投屏 LinkCast — ${status.label}"
+        statusView.setTextColor(colorFor(status.phase))
+        val working = status.phase == ConnectionStatus.Phase.Working ||
+            status.phase == ConnectionStatus.Phase.Connected
+        connectButton.isEnabled = !working
+        cancelButton.isEnabled = working
+        // 断开/暂停/关闭时隐藏 SurfaceView,露出深色背景遮掉残留的最后一帧;连接/投屏时显示。
+        surfaceView.visibility = if (working) View.VISIBLE else View.INVISIBLE
+        // 投屏中隐藏面板避免遮挡触控;其余状态显示。
+        panel.visibility = if (status.phase == ConnectionStatus.Phase.Connected) View.GONE else View.VISIBLE
+    }
+
+    // 细节子行:native 进度文案。
+    override fun onPhase(detail: String) {
+        phaseView.text = detail
+    }
+
+    private fun colorFor(phase: ConnectionStatus.Phase): Int = when (phase) {
+        ConnectionStatus.Phase.Connected -> 0xff5cd65c.toInt()   // 绿:已投屏
+        ConnectionStatus.Phase.Working -> 0xff5c9ad6.toInt()     // 蓝:工作中
+        ConnectionStatus.Phase.Paused -> 0xffd6b15c.toInt()      // 黄:暂停
+        ConnectionStatus.Phase.Off -> 0xff9aa0a6.toInt()         // 灰:关闭
     }
 
     override fun onLog(line: String) {

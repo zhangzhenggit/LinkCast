@@ -123,6 +123,19 @@ class VideoPipeline {
         }
     }
 
+    /**
+     * 断开连接时调用:停止解码,释放解码器并复位计数。
+     * 屏上残留的最后一帧由界面侧隐藏 SurfaceView 来遮掉(不在此涂黑,避免 Surface 在 Canvas/codec
+     * 两种生产者模式间切换导致重连时无法重新挂载解码器)。下次有帧到来会自动重建解码器。
+     */
+    fun clear() {
+        handler.post {
+            releaseDecoder()
+            frameCount = 0
+            fatalReported = false
+        }
+    }
+
     fun release() {
         handler.post {
             releaseDecoder()

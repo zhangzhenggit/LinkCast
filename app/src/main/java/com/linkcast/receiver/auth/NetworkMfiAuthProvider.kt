@@ -26,21 +26,47 @@ class NetworkMfiAuthProvider private constructor(
 ) : AuthProvider {
     override val canSign: Boolean = true
 
+    /**
+     * 取消句柄:[open] 在后台线程阻塞(连接/排队等待)时,持有其 socket;调用 [cancel] 关闭 socket
+     * 让阻塞的读/连接立即抛异常退出。Java 的 socket 阻塞读 interrupt 打不断,只能靠 close。
+     */
+    class Canceller {
+        @Volatile private var socket: Socket? = null
+        private var canceled = false
+
+        @Synchronized fun attach(s: Socket) {
+            if (canceled) runCatching { s.close() } else socket = s
+        }
+
+        @Synchronized fun cancel() {
+            canceled = true
+            runCatching { socket?.close() }
+            socket = null
+        }
+    }
+
     companion object {
         private const val TAG = "Network MFI"
         private const val CONNECT_TIMEOUT_MS = 6_000
         private const val HANDSHAKE_TIMEOUT_MS = 5_000
         private const val SESSION_TIMEOUT_MS = 60_000
         private const val CHALLENGE_TIMEOUT_MS = 5_000
-        // While queued, the server streams status frames periodically; allow a long
-        // per-frame and overall wait so we hold our queue slot instead of reconnecting.
+        // 排队期间服务器周期性推送状态帧(0x63);单条连接上等待,不重连(重连只会重新排队)。
         private const val QUEUE_WAIT_TIMEOUT_MS = 30_000
         private const val QUEUE_TOTAL_TIMEOUT_MS = 120_000L
-        private const val QUEUE_RETRY_DELAY_MS = 1_500L
-        private const val MAX_QUEUE_RETRIES = 40
         private const val ORIGINAL_VERSION_CODE = 297L
 
-        fun open(context: Context, config: LinkConfig, listener: (String) -> Unit): NetworkMfiAuthProvider? {
+        /**
+         * 向签名服务器申请证书。返回非空 = 成功(可签名)。
+         * 服务端终态裁决(0x62:到期/未授权/名额满)以 [NetworkMfiRejected] 上抛 —— 不重试,由上层暂停;
+         * 其它失败(连不上/排队超时等)返回 null,视为暂时不可用。
+         */
+        fun open(
+            context: Context,
+            config: LinkConfig,
+            canceller: Canceller,
+            listener: (String) -> Unit,
+        ): NetworkMfiAuthProvider? {
             RemoteConfig.ensureLoaded(listener)
             val host = RemoteConfig.host
             val ports = RemoteConfig.ports
@@ -50,30 +76,27 @@ class NetworkMfiAuthProvider private constructor(
             }
             val port = ports[portIndexFor(context, ports.size)]
             val payload = buildClientPayload(context, config)
-            var queueRetries = 0
-            while (queueRetries <= MAX_QUEUE_RETRIES) {
-                try {
-                    return connectAndReadCertificate(host, port, payload, listener)
-                } catch (queued: NetworkMfiQueued) {
-                    queueRetries += 1
-                    listener("$TAG 排队中 port=$port: ${queued.messageText}")
-                    Thread.sleep(QUEUE_RETRY_DELAY_MS)
-                } catch (error: Exception) {
-                    listener("$TAG 连接失败 host=$host port=$port: $error")
-                    return null
-                }
+            return try {
+                connectAndReadCertificate(host, port, payload, canceller, listener)
+            } catch (rejected: NetworkMfiRejected) {
+                // 终态裁决:不吞掉,上抛给调用方据此暂停(认证被拒)。
+                throw rejected
+            } catch (error: Exception) {
+                listener("$TAG 连接失败 host=$host port=$port: $error")
+                null
             }
-            listener("$TAG 排队超过上限($queueRetries),放弃")
-            return null
         }
 
         private fun connectAndReadCertificate(
             host: String,
             port: Int,
             payload: String,
+            canceller: Canceller,
             listener: (String) -> Unit,
         ): NetworkMfiAuthProvider {
             val socket = Socket()
+            // 交给取消句柄,使外部可在连接/排队阻塞期间关闭它。
+            canceller.attach(socket)
             socket.connect(InetSocketAddress(InetAddress.getByName(host), port), CONNECT_TIMEOUT_MS)
             socket.soTimeout = HANDSHAKE_TIMEOUT_MS
             socket.tcpNoDelay = true
@@ -101,14 +124,17 @@ class NetworkMfiAuthProvider private constructor(
                         socket.soTimeout = SESSION_TIMEOUT_MS
                         return NetworkMfiAuthProvider(socket, input, output, cert, listener)
                     }
+                    // 0x63 = 排队中(瞬时):服务器仍在处理,保持本连接继续等待。
                     0x63 -> {
                         val status = input.readExact(certHeader.length).toString(StandardCharsets.UTF_8)
-                        listener("MFI queue: $status")
+                        listener("MFI 排队中: $status")
                     }
+                    // 0x62 = 终态裁决(无证书):到期/未授权/名额满。对齐原版 —— 立即停、不重试。
                     0x62 -> {
                         val message = input.readExact(certHeader.length).toString(StandardCharsets.UTF_8)
+                        listener("MFI 认证被拒(0x62): $message")
                         runCatching { output.close() }; runCatching { input.close() }; runCatching { socket.close() }
-                        throw NetworkMfiQueued(message)
+                        throw NetworkMfiRejected(message)
                     }
                     else -> error("unexpected certificate command=${certHeader.command}")
                 }
@@ -184,7 +210,8 @@ class NetworkMfiAuthProvider private constructor(
 
 private data class NetworkMfiFrameHeader(val command: Int, val length: Int)
 
-private class NetworkMfiQueued(val messageText: String) : Exception(messageText)
+/** 签名服务器的终态裁决(0x62:试用到期/未授权/名额满)。不应重试,应据此暂停等待用户处理。 */
+class NetworkMfiRejected(message: String) : Exception(message)
 
 private fun InputStream.readFrameHeader(): NetworkMfiFrameHeader {
     val header = readExact(4)

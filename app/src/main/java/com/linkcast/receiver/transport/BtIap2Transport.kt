@@ -33,6 +33,9 @@ class BtIap2Transport(
         // created link (wires Iap2Link's transport member); starting the engine
         // before the link exists leaves that member dangling and crashes sendLsp.
         fun onLinkReady()
+        // RFCOMM 已连上、握手已发出(进入"等 iPhone 回 iAP2/认证"阶段)。用于起连接阶段看门狗:
+        // 手机已接上才算连接开始,即便 native 后续不上报任何状态(手机端没回握手)也能被超时兜住。
+        fun onRfcommConnected()
     }
 
     companion object {
@@ -129,6 +132,7 @@ class BtIap2Transport(
                     output?.write(INITIAL_HANDSHAKE)
                     writeFailures.set(0)
                     listener.onTransportLog("RFCOMM connected; iAP2 handle=$linkHandle")
+                    listener.onRfcommConnected()
                     readLoop(btSocket.inputStream)
                 }
             } catch (error: Exception) {
