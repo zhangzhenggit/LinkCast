@@ -26,7 +26,7 @@
         android:theme="@style/Theme.LinkCast"
         android:usesCleartextTraffic="true">
         <activity
-            android:name=".ui.MainActivity"
+            android:name=".ui.LinkActivity"
             android:exported="true">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
@@ -39,6 +39,10 @@
                 android:name="android.hardware.usb.action.USB_DEVICE_ATTACHED"
                 android:resource="@xml/usb_device_filter" />
         </activity>
+
+        <activity
+            android:name=".ui.SettingsActivity"
+            android:exported="false" />
 
         <service
             android:name=".CarPlayService"

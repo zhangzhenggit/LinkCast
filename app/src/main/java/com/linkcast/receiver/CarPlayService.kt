@@ -38,7 +38,7 @@ import com.linkcast.receiver.net.HotspotProvider
 import com.linkcast.receiver.net.MdnsDiscovery
 import com.linkcast.receiver.net.NetworkMonitor
 import com.linkcast.receiver.transport.BtIap2Transport
-import com.linkcast.receiver.ui.MainActivity
+import com.linkcast.receiver.ui.LinkActivity
 import java.nio.ByteBuffer
 
 class CarPlayService : Service(), NativeCallbacks, BtIap2Transport.Listener {
@@ -562,7 +562,7 @@ class CarPlayService : Service(), NativeCallbacks, BtIap2Transport.Listener {
         val pendingIntent = PendingIntent.getActivity(
             this,
             0,
-            Intent(this, MainActivity::class.java),
+            Intent(this, LinkActivity::class.java),
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
         )
         return if (Build.VERSION.SDK_INT >= 26) {
