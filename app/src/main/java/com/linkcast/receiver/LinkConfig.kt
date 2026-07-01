@@ -34,9 +34,9 @@ class LinkConfig(context: Context) {
     //   2 = 手动(广告静态凭据,连接外部已开好的 AP),仅调试对照用。
     val hotspotMode: Int get() = prefs.getInt("hotspot_mode", HOTSPOT_WIFI_DIRECT)
 
-    // 调试日志总开关。开启后项目自定义日志(经 LinkLog)才会输出。可读写、持久化。
+    // 调试日志总开关(= 日志浮窗开关)。默认关:零输出、零开销;开启才产生日志并显示浮窗。可读写、持久化。
     var diagLogEnabled: Boolean
-        get() = prefs.getInt("diag_log", 1) > 0
+        get() = prefs.getInt("diag_log", 0) > 0
         set(value) = prefs.edit { putInt("diag_log", if (value) 1 else 0) }
     val hotspotChannel: Int get() = prefs.getInt("etx_wifi_channel", 0)
     val autoConnect: Boolean get() = prefs.getInt("key_auto_connect", 1) > 0

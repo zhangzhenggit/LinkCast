@@ -15,4 +15,10 @@ interface LinkHost {
 
     /** 预览 SurfaceView 的 Surface 变化(创建/尺寸变化传非空,销毁传空)。 */
     fun onPreviewSurface(surface: Surface?, width: Int, height: Int)
+
+    /** 日志浮窗当前是否显示。 */
+    val isLogShown: Boolean
+
+    /** 开/关日志浮窗(开=打开日志+浮窗;关=关闭日志+移除浮窗,不占主界面)。 */
+    fun toggleLog()
 }

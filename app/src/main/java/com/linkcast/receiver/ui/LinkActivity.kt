@@ -20,7 +20,9 @@ import androidx.core.view.WindowInsetsControllerCompat
 import androidx.fragment.app.FragmentActivity
 import com.linkcast.receiver.CarPlayService
 import com.linkcast.receiver.ConnectionStatus
+import com.linkcast.receiver.LinkConfig
 import com.linkcast.receiver.R
+import com.linkcast.receiver.diag.LinkLog
 import com.linkcast.receiver.input.InputForwarder
 
 /**
@@ -34,9 +36,11 @@ class LinkActivity : FragmentActivity(), CarPlayService.StatusListener, LinkHost
     private enum class Mode { Home, Projection }
 
     private val inputForwarder = InputForwarder()
+    private lateinit var config: LinkConfig
     private lateinit var homeView: View
     private lateinit var fullscreenSurface: SurfaceView
     private lateinit var dotController: AssistiveDotController
+    private lateinit var floatingLog: FloatingLogWindow
 
     private var mode = Mode.Home
     private var screenW = 0
@@ -51,6 +55,7 @@ class LinkActivity : FragmentActivity(), CarPlayService.StatusListener, LinkHost
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        config = LinkConfig(this)
         val dm = resources.displayMetrics
         screenW = dm.widthPixels
         screenH = dm.heightPixels
@@ -73,43 +78,36 @@ class LinkActivity : FragmentActivity(), CarPlayService.StatusListener, LinkHost
             supportFragmentManager.beginTransaction()
                 .add(R.id.control_container, ControlFragment())
                 .add(R.id.preview_container, PreviewFragment())
-                .add(R.id.log_container, LogFragment())
                 .commitNow()
         }
 
         dotController = AssistiveDotController(this) { setMode(Mode.Home) }
+        floatingLog = FloatingLogWindow(this) { closeLog() }
         requestRuntimePermissions()
         setMode(Mode.Home)
         CarPlayService.start(this)
     }
 
-    // 按屏幕宽高比组合三个 Fragment 容器:细长屏左右排、接近方形上下排。
+    // 按屏幕宽高比组合两个 Fragment 容器:细长屏左右排(控制+预览)、接近方形上下排。
+    // 日志不再占布局,改为悬浮窗([FloatingLogWindow]),按需开启。
     private fun buildHome(): View {
         val wide = screenW.toFloat() / screenH >= 1.5f
         val control = container(R.id.control_container)
         val preview = container(R.id.preview_container)
-        val log = container(R.id.log_container)
         // 预览保持全屏比例的缩略;细长屏取屏宽 40%,方形屏取 58%。
         val pw = (screenW * (if (wide) 0.40f else 0.58f)).toInt()
         val ph = (pw * screenH.toFloat() / screenW).toInt()
         return if (wide) {
-            val top = LinearLayout(this).apply {
+            LinearLayout(this).apply {
                 orientation = LinearLayout.HORIZONTAL
                 addView(control, LinearLayout.LayoutParams(0, MATCH, 1f))
-                addView(preview, LinearLayout.LayoutParams(pw, MATCH))
-            }
-            LinearLayout(this).apply {
-                orientation = LinearLayout.VERTICAL
-                addView(top, LinearLayout.LayoutParams(MATCH, ph))
-                addView(log, LinearLayout.LayoutParams(MATCH, 0, 1f))
+                addView(preview, LinearLayout.LayoutParams(pw, ph).apply { gravity = Gravity.TOP })
             }
         } else {
-            val previewParams = LinearLayout.LayoutParams(pw, ph).apply { gravity = Gravity.CENTER_HORIZONTAL }
             LinearLayout(this).apply {
                 orientation = LinearLayout.VERTICAL
-                addView(preview, previewParams)
-                addView(control, LinearLayout.LayoutParams(MATCH, ViewGroup.LayoutParams.WRAP_CONTENT))
-                addView(log, LinearLayout.LayoutParams(MATCH, 0, 1f))
+                addView(preview, LinearLayout.LayoutParams(pw, ph).apply { gravity = Gravity.CENTER_HORIZONTAL })
+                addView(control, LinearLayout.LayoutParams(MATCH, 0, 1f))
             }
         }
     }
@@ -126,6 +124,25 @@ class LinkActivity : FragmentActivity(), CarPlayService.StatusListener, LinkHost
     override fun onPreviewSurface(surface: Surface?, width: Int, height: Int) {
         previewSurface = surface; previewW = width; previewH = height
         updateActiveSurface()
+    }
+
+    override val isLogShown: Boolean get() = floatingLog.isShown
+
+    override fun toggleLog() { if (floatingLog.isShown) closeLog() else openLog() }
+
+    // 开:打开日志 + 显示浮窗;关:关闭日志(全链路零输出)+ 移除浮窗。状态持久化,并同步主页按钮文案。
+    private fun openLog() {
+        config.diagLogEnabled = true
+        LinkLog.enabled = true
+        floatingLog.show()
+        control()?.refreshLogButton()
+    }
+
+    private fun closeLog() {
+        config.diagLogEnabled = false
+        LinkLog.enabled = false
+        floatingLog.hide()
+        control()?.refreshLogButton()
     }
 
     // —— 模式切换 ——
@@ -166,7 +183,7 @@ class LinkActivity : FragmentActivity(), CarPlayService.StatusListener, LinkHost
     }
 
     override fun onPhase(detail: String) { control()?.renderDetail(detail) }
-    override fun onLog(line: String) = Unit  // 日志由 LogFragment 自行订阅 LinkLog
+    override fun onLog(line: String) = Unit  // 日志由 FloatingLogWindow 自行订阅 LinkLog
 
     private fun control() = supportFragmentManager.findFragmentById(R.id.control_container) as? ControlFragment
     private fun preview() = supportFragmentManager.findFragmentById(R.id.preview_container) as? PreviewFragment
@@ -178,17 +195,22 @@ class LinkActivity : FragmentActivity(), CarPlayService.StatusListener, LinkHost
         CarPlayService.statusListener = this
         onStatus(CarPlayService.connectionStatus)
         if (mode == Mode.Projection) dotController.show()
+        // 恢复上次的日志浮窗状态(持久化)。
+        if (config.diagLogEnabled) floatingLog.show()
+        control()?.refreshLogButton()
     }
 
     override fun onPause() {
         if (CarPlayService.statusListener === this) CarPlayService.statusListener = null
         dotController.hide()
+        floatingLog.hide()
         super.onPause()
     }
 
     override fun onDestroy() {
         if (CarPlayService.statusListener === this) CarPlayService.statusListener = null
         dotController.hide()
+        floatingLog.hide()
         inputForwarder.release()
         CarPlayService.attachSurface(null, 0, 0)
         super.onDestroy()

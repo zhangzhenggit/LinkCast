@@ -1,7 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <!-- 三个 Fragment 容器的固定 id(供程序化布局复用,配置变更后能重新挂回)。 -->
+    <!-- Fragment 容器的固定 id(供程序化布局复用,配置变更后能重新挂回)。 -->
     <item name="control_container" type="id" />
     <item name="preview_container" type="id" />
-    <item name="log_container" type="id" />
 </resources>

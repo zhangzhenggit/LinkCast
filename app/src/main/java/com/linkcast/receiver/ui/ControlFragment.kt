@@ -24,6 +24,7 @@ class ControlFragment : Fragment() {
     private lateinit var autoButton: Button
     private lateinit var connectButton: Button
     private lateinit var disconnectButton: Button
+    private lateinit var logButton: Button
 
     override fun onCreateView(inflater: LayoutInflater, container: ViewGroup?, savedInstanceState: Bundle?): View {
         val ctx = requireContext()
@@ -45,9 +46,12 @@ class ControlFragment : Fragment() {
         autoButton = Button(ctx).apply { setOnClickListener { toggleAuto() } }
         connectButton = Button(ctx).apply { text = "立即连接"; setOnClickListener { CarPlayService.connect(ctx) } }
         disconnectButton = Button(ctx).apply { text = "断开"; setOnClickListener { CarPlayService.cancel(ctx) } }
+        logButton = Button(ctx).apply {
+            setOnClickListener { (activity as? LinkHost)?.toggleLog(); refreshLogButton() }
+        }
         val controlRow = LinearLayout(ctx).apply {
             orientation = LinearLayout.HORIZONTAL
-            addView(autoButton); addView(connectButton); addView(disconnectButton)
+            addView(autoButton); addView(connectButton); addView(disconnectButton); addView(logButton)
         }
         infoView = TextView(ctx).apply { textSize = 12f; setTextColor(0xffb8c0cc.toInt()) }
 
@@ -63,6 +67,13 @@ class ControlFragment : Fragment() {
         super.onResume()
         render(CarPlayService.connectionStatus)
         CarPlayService.lastPhase.takeIf { it.isNotEmpty() }?.let { renderDetail(it) }
+        refreshLogButton()
+    }
+
+    /** 刷新"日志浮窗"按钮文案(反映浮窗开/关)。 */
+    fun refreshLogButton() {
+        if (view == null) return
+        logButton.text = if ((activity as? LinkHost)?.isLogShown == true) "日志浮窗:开" else "日志浮窗:关"
     }
 
     fun render(status: ConnectionStatus) {
