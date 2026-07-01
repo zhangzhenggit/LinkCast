@@ -90,9 +90,6 @@ class VideoPipeline {
         handler.post {
             try {
                 frameCount++
-                if (frameCount % 60 == 1L) {
-                    LinkLog.d(TAG) { "视频帧 #$frameCount keyFrame=${(flags and 0x8000) != 0}" }
-                }
                 val decoder = codec ?: rebuildDecoder()
                 if (decoder == null) {
                     LinkLog.w(TAG) { "无解码器,丢弃帧 #$frameCount" }
